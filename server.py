@@ -75,6 +75,10 @@ DEFAULT_MODELS = {
 # "the model itself is the problem, not the request" family of failures.
 # When we see one of these, we rewrite the error into a message that tells
 # the creator to change the Model Name field instead of showing a raw stack.
+#
+# Add new markers as vendors invent new wordings — one substring hit is enough,
+# so being generous here is safe (a false positive just gives the creator a
+# clearer error message than a raw stack trace).
 MODEL_UNAVAILABLE_MARKERS = (
     "no longer available",
     "not found for api version",
@@ -86,7 +90,25 @@ MODEL_UNAVAILABLE_MARKERS = (
     "model_not_found",
     "not supported for this",
     "does not have access to model",
-    "the model",  # generic Gemini "the model X is..." prefix
+    "the model ",              # narrower than "the model" — avoids matching random prose
+    "404 models/",             # google's exact format: "404 models/gemini-x-y is not found..."
+    "does not support",        # "model X does not support generateContent"
+    "is not available",        # anthropic phrasing
+    "you don't have access",   # openai/anthropic phrasing
+    "permission denied",       # some vendors use this for access-denied-to-model
+)
+
+# Exception CLASS names we treat as "the model is the problem." SDK-agnostic —
+# doesn't care whether it's google.api_core.exceptions.NotFound or
+# openai.NotFoundError or anthropic.NotFoundError; the shared word is NotFound.
+# This is the belt-and-braces layer for when str(e) doesn't include a marker
+# above (some SDK versions truncate the message before we see it).
+MODEL_UNAVAILABLE_EXCEPTION_TYPES = (
+    "NotFound",
+    "NotFoundError",
+    "BadRequestError",       # openai sometimes uses this for unknown model
+    "PermissionDeniedError", # anthropic returns this for model-access-denied
+    "InvalidArgument",       # google grpc equivalent
 )
 
 
@@ -437,10 +459,35 @@ VALID_EXPRESSIONS = {
 # ==========================================
 # 4. MULTI-MODEL ADAPTER & PARSER
 # ==========================================
-def _is_model_unavailable(err_text: str) -> bool:
-    """True if the error string smells like 'the model name itself is bad',
-    as opposed to a transient network hiccup or a payload problem."""
-    low = (err_text or "").lower()
+def _is_model_unavailable(exc: Exception) -> bool:
+    """True if this exception smells like 'the model name itself is bad',
+    as opposed to a transient network hiccup or a payload problem.
+
+    Checks three signals so we catch this class of failure regardless of which
+    provider raised it or how their SDK phrases the error:
+      1. Substring match on the error text (widest net, may need updating)
+      2. Exception CLASS name (survives SDK message-format changes)
+      3. HTTP status code, if the exception exposes one (most reliable when present)
+    """
+    if exc is None:
+        return False
+
+    # Signal 3: HTTP status code. Most SDK exceptions expose one of these
+    # attributes. 404 = model doesn't exist. 400 = model rejected by vendor.
+    # 403 = your account isn't allowed to use this model.
+    for attr in ("status_code", "code", "http_status"):
+        code = getattr(exc, attr, None)
+        # Some SDKs put an object here (e.g. grpc StatusCode); coerce to str
+        if code is not None and str(code) in ("404", "400", "403"):
+            return True
+
+    # Signal 2: exception class name. Works even if str(e) is empty or wrapped.
+    exc_type_name = type(exc).__name__
+    if exc_type_name in MODEL_UNAVAILABLE_EXCEPTION_TYPES:
+        return True
+
+    # Signal 1: substring match on the error message (case-insensitive).
+    low = str(exc).lower() if exc else ""
     return any(marker in low for marker in MODEL_UNAVAILABLE_MARKERS)
 
 
@@ -517,11 +564,21 @@ def call_llm(prompt, system_instruction, provider, api_key, model_name):
         raise
     except Exception as e:
         err_str = str(e)
+        # Log the exception class and any status code, so if this ever misses
+        # a real "model is bad" case we can see exactly what markers to add.
+        # Shows up in Render/uvicorn logs; safe to leave on in production.
+        status_hint = next(
+            (str(getattr(e, a)) for a in ("status_code", "code", "http_status") if getattr(e, a, None) is not None),
+            "no-status"
+        )
+        print(f"[call_llm] {provider}/{resolved_model} raised {type(e).__name__} "
+              f"(status={status_hint}): {err_str[:200]}")
+
         # The specific class of failure the mentor hit: vendor says the model
         # itself is not available to this account. Repromoting this into a
         # dedicated exception lets the pipeline give up with a helpful message
         # instead of retrying three times on a name that will never resolve.
-        if _is_model_unavailable(err_str):
+        if _is_model_unavailable(e):
             first_line = err_str.splitlines()[0][:250] if err_str else "(no detail)"
             raise ModelUnavailableError(
                 f"The {provider.title()} API rejected the model name "
@@ -1088,5 +1145,3 @@ def tweak_scene_endpoint(req: TweakSceneRequest):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Scene tweak failed: {str(e)}")
-
-    
