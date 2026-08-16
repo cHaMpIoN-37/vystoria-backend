@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+import random
 import traceback
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -42,13 +43,82 @@ app.add_middleware(
 # creator pasting a whole novel doesn't blow the context window / cost.
 MAX_REFERENCE_CHARS = 12000
 
+# Real-world naming traditions we rotate through to break Gemini/GPT's
+# "every fantasy protagonist is Kaelen or Lyra" bias. A fresh random draw
+# per generation means back-to-back stories won't share a name pool.
+NAMING_TRADITIONS = [
+    "Yoruba", "Vietnamese", "Farsi", "Quechua", "Icelandic", "Tamil",
+    "Basque", "Amharic", "Māori", "Hungarian", "Georgian", "Uzbek",
+    "Ojibwe", "Bengali", "Slovenian", "Malagasy", "Kurdish", "Finnish",
+    "Sinhalese", "Zulu", "Mongolian", "Catalan", "Tagalog", "Swahili",
+    "Armenian", "Thai", "Croatian", "Punjabi",
+]
+
+def pick_naming_pool(k: int = 3) -> str:
+    return ", ".join(random.sample(NAMING_TRADITIONS, k))
+
+# Modern, widely-available default model IDs — only used as a fallback when
+# the frontend forgets to send `model_name`. These strings drift every few
+# months as providers retire models, so keep them fresh. The MENTOR-FACING
+# lesson learned: hard-coding a specific model version and shipping it to a
+# fresh account will break whenever the vendor deprecates that model for
+# new users. The frontend now sends a user-editable model string; these are
+# just safety nets.
+DEFAULT_MODELS = {
+    "gemini": "gemini-3.5-flash",     # stable, replaces the 2.5-flash line
+    "openai": "gpt-4o",
+    "claude": "claude-sonnet-4-6",    # stable Sonnet 4 tier — broadest availability
+    "grok":   "grok-2-latest",
+}
+
+# Substrings we look for inside an SDK exception message to recognize the
+# "the model itself is the problem, not the request" family of failures.
+# When we see one of these, we rewrite the error into a message that tells
+# the creator to change the Model Name field instead of showing a raw stack.
+MODEL_UNAVAILABLE_MARKERS = (
+    "no longer available",
+    "not found for api version",
+    "was not found",
+    "does not exist",
+    "invalid model",
+    "model not found",
+    "unknown model",
+    "model_not_found",
+    "not supported for this",
+    "does not have access to model",
+    "the model",  # generic Gemini "the model X is..." prefix
+)
+
+
+def suggested_alternatives(provider: str) -> str:
+    """Human-readable list of currently-safe model IDs for a given provider,
+    used in error messages so the creator knows exactly what to paste."""
+    provider = (provider or "").lower()
+    if provider == "gemini":
+        return "gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3.7-flash"
+    if provider == "openai":
+        return "gpt-4o, gpt-4o-mini, gpt-4-turbo"
+    if provider == "claude":
+        return "claude-sonnet-4-6, claude-opus-4-8, claude-haiku-4-5-20251001"
+    if provider == "grok":
+        return "grok-2-latest, grok-2-beta"
+    return "(unknown provider — check the vendor's docs for current model IDs)"
+
+
+class ModelUnavailableError(Exception):
+    """Raised by call_llm when the vendor rejects the *model itself* (as
+    opposed to the request payload). Carries a pre-formatted, creator-facing
+    message so the pipeline can log it and give up cleanly instead of
+    retrying forever on a name that will never resolve."""
+
+
 # ==========================================
 # 2. DATA MODELS
 # ==========================================
 class GenerateRequest(BaseModel):
     provider: str      # 'gemini', 'openai', 'grok', 'claude'
     api_key: str       # Custom key provided by the creator
-    model_name: str    # e.g., 'gemini-1.5-flash', 'gpt-4o', 'grok-2-beta'
+    model_name: str    # Any string the vendor accepts — free-text on the frontend
     title: str
     subtitle: str
     genre: str
@@ -92,8 +162,34 @@ You are a master Visual Novel writer. Create a rich, dark, atmospheric Visual No
 1. **Protagonist**
 2. **Main Characters** (8-12 total)
 3. **Key Locations** (15-20)
-4. **Core Rules & Systems** 5. **Major Themes** and **Emotional Arc**
+4. **Core Rules & Systems**
+5. **Major Themes** and **Emotional Arc**
 6. **Writing Style Guidelines**
+
+**NAMING RULES (critical — read carefully):**
+- Do NOT default to generic fantasy/AI-slop names. AVOID entirely: Kaelen, Kael, Kaelin, Lyra,
+  Lyria, Elara, Aria, Aeris, Seraphina, Serana, Thorne, Vance, Ashe, Ash, Rowan, Kieran, Sylas,
+  Silas, Nyx, Zephyr, Zephyros, Cassian, Cassia, Alaric, Xander, Draven, Ryker, Elowen. These
+  are overused and will make the story feel derivative.
+- For this specific story, draw ALL character names from these real-world naming traditions:
+  **{naming_pool}**. Match the setting's implied culture where possible; when in doubt, mix
+  the three traditions above so the cast feels varied rather than mono-cultural.
+- Every character has ONE canonical short name — the exact string used in every line of dialogue
+  attributed to them. Titles ("Dr.", "Captain", "Elder") and surnames go in the character bio,
+  NEVER in the speaker field. If you introduce "Dr. Amara Okonkwo", her canonical name is
+  "Amara" and every dialogue line she speaks is attributed to "Amara" — never "Dr. Amara",
+  "Okonkwo", or "Dr. Okonkwo".
+
+**REQUIRED — Character Roster block (must appear verbatim, exactly once, at the end of your
+output). Every named character in the story MUST have a line here.**
+```roster
+- canonical: <ShortName>  | full: <Full Name with title if any>  | expressions: neutral, worried, angry, determined
+- canonical: <ShortName>  | full: <Full Name>                    | expressions: neutral, smug, thoughtful, scared
+```
+The `canonical` field is what will appear in every dialogue "speaker" field throughout the
+story. Pick 4-8 expressions per character based on their emotional range. Valid expression
+ids are ONLY: neutral, happy, sad, angry, surprised, worried, determined, smug, scared,
+thoughtful. Do not invent new ones.
 """
 
 OUTLINE_PROMPT = """
@@ -114,31 +210,52 @@ You are writing Chapter {chapter_number} of the Visual Novel.
 **World Bible:**\n{world_bible}
 **Overall Outline:**\n{outline}
 **Previous Chapters Summary:**\n{previous_summary}
+**Character Roster (use these EXACT speaker names — see World Bible):**\n{roster}
 
-Write Chapter {chapter_number}. Generate 15-25 scenes.
-Give the player a meaningful choice roughly every 3-5 scenes — do not let more than 5
-scenes pass in a row without a branching choice. Aim for at least 4-6 choice points
-across the chapter, not just 1-2. Choices should meaningfully diverge (different next_scene
-paths), not just reword the same outcome.
-For scenes with NO choices, use "next_scene_default": "next_scene_id".
+Write Chapter {chapter_number}. Generate 18-25 scenes.
 
-**CHOICE FORMATTING RULES (very important):**
-1. Every scene that has "choices" MUST also include a "choice_prompt" field: 1-2 sentences
-   of in-world narrative or dialogue text that sets up the decision — e.g. a question a
-   character asks, a moment of tension, or what the protagonist is weighing. This text
-   appears on screen right before the choice buttons, so it must give the player real
-   context for what they're deciding. NEVER use generic filler like "Make a decision" or
-   "What will you do" — write the actual situational text.
-2. Each individual choice's "text" MUST be SHORT — a maximum of 6-7 words. Write it as a
-   punchy action or phrase, not a full sentence. 
-   Good: "Fight the guard", "Ask about the ring", "Stay silent", "Trust her warning"
+**DIALOGUE-HEAVY PACING (very important — this is a Visual Novel, not a short story):**
+- Target ratio inside "sequence": ~70% dialogue blocks, ~30% narrative blocks.
+- No scene should have more than 2 narrative blocks in a row without a dialogue block breaking it up.
+- Prefer short, punchy dialogue exchanges between multiple characters over long internal monologues.
+- Narrative blocks are for scene-setting and physical action beats ONLY — not for restating what
+  a character just said or explaining feelings the dialogue already showed. Trust the dialogue.
+- A scene with zero dialogue is a code smell — if a scene has no character speaking, ask whether
+  it should be merged with an adjacent scene instead.
+
+**CHOICE DENSITY:**
+- Give the player a meaningful choice every 2-4 scenes. Aim for 6-9 choice points across the chapter.
+- Choices MUST diverge into different next_scene paths (not two paths that reconverge in one scene).
+- For scenes with NO choices, use "next_scene_default": "next_scene_id".
+
+**CHOICE FORMATTING RULES:**
+1. Every scene with "choices" MUST include a "choice_prompt" field: 1-2 sentences of real in-world text
+   (a character's question, a beat of tension, what the protagonist is weighing). NEVER use filler like
+   "Make a decision" or "What will you do".
+2. Each "text" in choices MUST be under 7 words — a punchy action or phrase, not a full sentence.
+   Good: "Fight the guard", "Ask about the ring", "Stay silent"
    Bad: "You decide to attack the guard before he can call for backup"
+
+**SPEAKER NAME RULE (critical for asset matching):**
+- Every dialogue block's "speaker" field MUST match a canonical name from the Character Roster above,
+  EXACTLY as written there. Do NOT add titles ("Dr. Amara"), surnames ("Amara Okonkwo"), or
+  nicknames ("Am"). If the roster says "Amara", every line she says uses "Amara" — no exceptions.
+- If a character speaks who is NOT in the roster, use a generic descriptor as the speaker:
+  "Guard", "Shopkeeper", "Old Woman", "Radio Voice". Never invent a new proper name mid-chapter —
+  that would create a duplicate character with no portrait asset.
+
+**EXPRESSIONS (for character portraits — every dialogue block needs one):**
+- Every "dialogue" block MUST include an "expression" field. Pick ONE of exactly these ten values:
+  neutral, happy, sad, angry, surprised, worried, determined, smug, scared, thoughtful.
+- Match expression to the line's emotional content. Default to "neutral" only for flat/matter-of-fact lines.
+- Prefer the expressions listed for that character in the roster, but any of the ten values is valid.
+- "narrative" blocks do NOT get an expression field.
 
 **CRITICAL JSON RULES:**
 1. Output ONLY valid JSON. No conversational text before or after.
-2. If you use quotes inside "text", you MUST escape them. Example: "text": "She said, \\"Hello.\\""
-3. Do NOT include trailing commas at the end of lists or objects.
-4. The FINAL scene of the chapter MUST NOT have choices. It must end linearly using "next_scene_default".
+2. Escape inner quotes: "text": "She said, \\"Hello.\\""
+3. No trailing commas.
+4. The FINAL scene of the chapter MUST NOT have choices — end linearly with "next_scene_default".
 
 **Output ONLY valid JSON** in this exact structure:
 {{
@@ -147,11 +264,12 @@ For scenes with NO choices, use "next_scene_default": "next_scene_id".
   "scenes": [
     {{
       "id": "ch{chapter_number}_scene01",
-      "background": "black",
-      "next_scene_default": "ch{chapter_number}_scene02", 
+      "background": "clinic_night",
+      "next_scene_default": "ch{chapter_number}_scene02",
       "sequence": [
         {{ "type": "narrative", "text": "..." }},
-        {{ "type": "dialogue", "speaker": "Name", "text": "..." }}
+        {{ "type": "dialogue", "speaker": "Amara", "expression": "worried", "text": "..." }},
+        {{ "type": "dialogue", "speaker": "Bayo",  "expression": "angry",   "text": "..." }}
       ],
       "choice_prompt": "The guard's hand moves to his sword. There's no more time to think.",
       "choices": [
@@ -162,7 +280,7 @@ For scenes with NO choices, use "next_scene_default": "next_scene_id".
   ]
 }}
 
-Note: scenes with NO choices should omit "choice_prompt" and "choices" entirely and just use "next_scene_default".
+Scenes with NO choices should omit "choice_prompt" and "choices" and just use "next_scene_default".
 """
 
 ASSET_MANIFEST_PROMPT = """
@@ -171,21 +289,35 @@ You are cataloging the visual assets needed for a Visual Novel.
 **World Bible:**
 {world_bible}
 
-**Speaker names that actually appear in the finished story (one entry each, no more/fewer):**
-{speakers}
+**Speaker → expressions actually used in the finished story (one entry per canonical character):**
+{speaker_expressions}
 
 **Background location IDs that actually appear (one entry each, no more/fewer):**
 {backgrounds}
 
-For each speaker, write a concise (1-2 sentence) physical/costume description for a portrait artist.
-For each background ID, write a concise (1-2 sentence) setting description for a background artist.
+For each character, write ONE base physical/costume description (1-2 sentences, ignoring mood —
+this is what the artist reuses across every expression variant). Then, for each expression
+listed for that character, write a SHORT phrase describing face/posture only (e.g. "brows drawn,
+jaw tight" for angry). The artist will layer the expression on top of the base description.
+
+For each background ID, write a concise (1-2 sentence) setting description.
 Also write ONE cover art description: a striking, poster-style scene (1-2 sentences) that
 captures the story's tone and would work as a thumbnail/cover image.
 
 Output ONLY valid JSON in this exact structure:
 {{
-  "characters": [ {{ "name": "...", "description": "..." }} ],
-  "backgrounds": [ {{ "id": "...", "description": "..." }} ],
+  "characters": [
+    {{
+      "name": "Amara",
+      "base_description": "Tall Yoruba woman in a bloodstained field medic's coat, close-cropped hair, silver ear cuff.",
+      "expressions": [
+        {{ "id": "neutral", "note": "level gaze, mouth relaxed" }},
+        {{ "id": "worried", "note": "brows drawn, lips pressed thin" }},
+        {{ "id": "angry",   "note": "jaw set, eyes narrowed, chin forward" }}
+      ]
+    }}
+  ],
+  "backgrounds": [ {{ "id": "clinic_night", "description": "..." }} ],
   "cover": {{ "description": "..." }}
 }}
 """
@@ -209,7 +341,8 @@ A. Choice Impact & Player Agency — Do branching choices lead to genuinely diff
    Are choice "text" values punchy and under ~7 words?
 
 B. World-Bible & Lore Consistency — Does the story respect the rules, characters, and settings
-   established in the World Bible? Flag any location/power/character inconsistency.
+   established in the World Bible? Flag any location/power/character inconsistency. Also flag
+   any dialogue "speaker" value that doesn't match a canonical roster name.
 
 C. Stylistic & Tonal Cohesion — Does the prose match the requested genre/tone and the World
    Bible's writing style guidelines? Flag generic tropes or tone-breaking modern slang.
@@ -217,8 +350,9 @@ C. Stylistic & Tonal Cohesion — Does the prose match the requested genre/tone 
 D. Character Voice & Agency — Do characters have distinct speech patterns matching their
    profiles? Does the protagonist make active decisions rather than passively drifting?
 
-E. Interactive UX & Narrative Flow — Is the narration -> dialogue -> choice_prompt -> choices
-   pacing natural? Flag jarring scene transitions or weak/generic choice prompts.
+E. Interactive UX & Narrative Flow — Is the dialogue-to-narration ratio healthy (target ~70%
+   dialogue)? Are expression tags being used and do they match the emotional content of the
+   lines? Flag jarring scene transitions or weak/generic choice prompts.
 
 **CRITICAL JSON RULES:**
 1. Output ONLY valid JSON. No conversational text before or after.
@@ -244,7 +378,7 @@ Output ONLY valid JSON in this exact structure:
 }}
 """
 
-# NEW: targeted single-scene rewrite prompt. Deliberately scoped so the model
+# Targeted single-scene rewrite prompt. Deliberately scoped so the model
 # cannot rewrite the whole book when the creator only dislikes one moment.
 TWEAK_PROMPT = """
 You are revising a SINGLE scene of an already-written Visual Novel, per the creator's instruction.
@@ -256,13 +390,17 @@ You are NOT rewriting the story — only this one scene. Do not reference or inv
    verbatim from the original scene JSON below. Do NOT invent new scene ids, and do NOT remove a
    linking field that was present in the original — the rest of the story links to this scene by
    those exact ids and a dangling/renamed id will break the game.
-3. You MAY change: background, sequence (narrative/dialogue text), choice_prompt, and the wording
-   of each choice's "text" — but if choices exist, the NUMBER of choices and their "next_scene"
-   targets must stay the same as the original unless the creator's instruction explicitly asks you
-   to add or remove a branch.
-4. Keep the same choice-formatting rules as the rest of the story: choice_prompt required whenever
-   choices exist (1-2 sentences of real in-world setup, never generic filler), and each choice
-   "text" is a punchy phrase under ~7 words.
+3. You MAY change: background, sequence (narrative/dialogue text/expression), choice_prompt, and
+   the wording of each choice's "text" — but if choices exist, the NUMBER of choices and their
+   "next_scene" targets must stay the same as the original unless the creator's instruction
+   explicitly asks you to add or remove a branch.
+4. Keep the same formatting rules as the rest of the story:
+   - choice_prompt required whenever choices exist (1-2 sentences of real in-world setup, never generic filler)
+   - each choice "text" is a punchy phrase under ~7 words
+   - every dialogue block keeps an "expression" field (one of: neutral, happy, sad, angry,
+     surprised, worried, determined, smug, scared, thoughtful)
+   - dialogue "speaker" values stay as the exact canonical names used in the original scene —
+     don't add titles/surnames or rename anyone.
 
 **World Bible (tone/consistency reference only):**
 {world_bible}
@@ -288,65 +426,112 @@ JUDGE_RUBRIC = {
     "narrative_flow":   {"weight": 0.15, "min_pass": 6.0},
 }
 
+# Whitelist of expression ids we allow the model to use. Anything outside
+# this set gets normalized to "neutral" so the frontend never has to guess
+# whether "furious" or "irate" should map onto the "angry" asset slot.
+VALID_EXPRESSIONS = {
+    "neutral", "happy", "sad", "angry", "surprised",
+    "worried", "determined", "smug", "scared", "thoughtful",
+}
+
 # ==========================================
 # 4. MULTI-MODEL ADAPTER & PARSER
 # ==========================================
+def _is_model_unavailable(err_text: str) -> bool:
+    """True if the error string smells like 'the model name itself is bad',
+    as opposed to a transient network hiccup or a payload problem."""
+    low = (err_text or "").lower()
+    return any(marker in low for marker in MODEL_UNAVAILABLE_MARKERS)
+
+
 def call_llm(prompt, system_instruction, provider, api_key, model_name):
-    """Dynamically routes the prompt to the selected LLM provider."""
-    provider = provider.lower()
+    """Dynamically routes the prompt to the selected LLM provider.
 
-    if provider == 'gemini':
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name or 'gemini-1.5-flash', system_instruction=system_instruction)
-        response = model.generate_content(prompt)
+    All vendor-specific SDK exceptions are caught and re-raised as either
+    ModelUnavailableError (creator needs to change the model name) or plain
+    Exception (transient / retryable). Both carry a message safe to show
+    the creator directly."""
+    provider = (provider or "").lower()
+    resolved_model = (model_name or DEFAULT_MODELS.get(provider) or "").strip()
+    if not resolved_model:
+        raise ModelUnavailableError(
+            f"No model name provided for provider '{provider}'. "
+            f"Try one of: {suggested_alternatives(provider)}."
+        )
 
-        if not response.candidates:
-            raise Exception(
-                f"Gemini returned no candidates. prompt_feedback={getattr(response, 'prompt_feedback', None)}"
+    try:
+        if provider == 'gemini':
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(resolved_model, system_instruction=system_instruction)
+            response = model.generate_content(prompt)
+
+            if not response.candidates:
+                raise Exception(
+                    f"Gemini returned no candidates. prompt_feedback={getattr(response, 'prompt_feedback', None)}"
+                )
+            candidate = response.candidates[0]
+            finish_reason = getattr(candidate, 'finish_reason', None)
+            if finish_reason is not None and str(finish_reason) not in ('1', 'STOP', 'FinishReason.STOP'):
+                raise Exception(
+                    f"Gemini stopped generating early (finish_reason={finish_reason}). "
+                    f"This usually means the safety filters blocked the content (common with "
+                    f"dark/violent genres) or max_output_tokens was too low. "
+                    f"safety_ratings={getattr(candidate, 'safety_ratings', None)}"
+                )
+            return response.text
+
+        elif provider == 'openai':
+            import openai
+            client = openai.OpenAI(api_key=api_key)
+            resp = client.chat.completions.create(
+                model=resolved_model,
+                messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
             )
-        candidate = response.candidates[0]
-        finish_reason = getattr(candidate, 'finish_reason', None)
-        if finish_reason is not None and str(finish_reason) not in ('1', 'STOP', 'FinishReason.STOP'):
-            raise Exception(
-                f"Gemini stopped generating early (finish_reason={finish_reason}). "
-                f"This usually means the safety filters blocked the content (common with "
-                f"dark/violent genres) or max_output_tokens was too low. "
-                f"safety_ratings={getattr(candidate, 'safety_ratings', None)}"
+            return resp.choices[0].message.content
+
+        elif provider == 'grok':
+            import openai
+            client = openai.OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
+            resp = client.chat.completions.create(
+                model=resolved_model,
+                messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
             )
-        return response.text
+            return resp.choices[0].message.content
 
-    elif provider == 'openai':
-        import openai
-        client = openai.OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=model_name or "gpt-4o",
-            messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
-        )
-        return resp.choices[0].message.content
+        elif provider == 'claude':
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            resp = client.messages.create(
+                model=resolved_model,
+                max_tokens=4000,
+                system=system_instruction,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return resp.content[0].text
 
-    elif provider == 'grok':
-        import openai
-        client = openai.OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
-        resp = client.chat.completions.create(
-            model=model_name or "grok-2-beta",
-            messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
-        )
-        return resp.choices[0].message.content
+        else:
+            raise ValueError(f"Unsupported Provider: {provider}")
 
-    elif provider == 'claude':
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-        resp = client.messages.create(
-            model=model_name or "claude-3-5-sonnet-20240620",
-            max_tokens=4000,
-            system=system_instruction,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return resp.content[0].text
-
-    else:
-        raise ValueError(f"Unsupported Provider: {provider}")
+    except ModelUnavailableError:
+        raise
+    except Exception as e:
+        err_str = str(e)
+        # The specific class of failure the mentor hit: vendor says the model
+        # itself is not available to this account. Repromoting this into a
+        # dedicated exception lets the pipeline give up with a helpful message
+        # instead of retrying three times on a name that will never resolve.
+        if _is_model_unavailable(err_str):
+            first_line = err_str.splitlines()[0][:250] if err_str else "(no detail)"
+            raise ModelUnavailableError(
+                f"The {provider.title()} API rejected the model name "
+                f"'{resolved_model}': {first_line}\n\n"
+                f"👉 This usually means the model has been deprecated for new "
+                f"accounts, or the model ID has a typo. Go to Engine Config and "
+                f"try one of these current model IDs instead:\n"
+                f"   {suggested_alternatives(provider)}"
+            ) from e
+        raise
 
 def clean_json_output(raw_text):
     """Zero-Regex Brace Counting Algorithm."""
@@ -366,36 +551,124 @@ def clean_json_output(raw_text):
             return raw_text[start_idx:end_idx+1]
     return raw_text.strip()
 
-def build_asset_manifest(world_bible, speaker_names, background_ids, provider, api_key, model_name):
-    """Catalogs character/background/cover art descriptions. Never raises —
-    falls back to bare names if the LLM call or JSON parse fails, so this can
-    safely run inside a thread pool alongside the Judge evaluation."""
+
+def parse_character_roster(world_bible: str):
+    """Extracts the ```roster fenced block from the World Bible.
+    Returns (roster_text_for_prompt, canonical_names_set, expressions_by_char)."""
+    m = re.search(r"```roster\s*(.*?)```", world_bible, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return "(no roster provided — use single-name speakers only)", set(), {}
+
+    canonical_names = set()
+    expressions_by_char = {}
+    lines_for_prompt = []
+
+    for line in m.group(1).splitlines():
+        line = line.strip().lstrip("-").strip()
+        if not line:
+            continue
+        parts = {p.split(":", 1)[0].strip().lower(): p.split(":", 1)[1].strip()
+                 for p in line.split("|") if ":" in p}
+        canon = parts.get("canonical")
+        if not canon:
+            continue
+        canonical_names.add(canon)
+        exprs = [e.strip() for e in parts.get("expressions", "neutral").split(",") if e.strip()]
+        expressions_by_char[canon] = exprs
+        lines_for_prompt.append(f"- {canon} ({parts.get('full', canon)}) — expressions: {', '.join(exprs)}")
+
+    return "\n".join(lines_for_prompt) or "(roster block was empty)", canonical_names, expressions_by_char
+
+
+def normalize_speakers(scenes, canonical_names):
+    """Rewrites any dialogue speaker that fuzzy-matches a canonical name to that canonical name.
+    Also normalizes each dialogue block's "expression" field."""
+    canon_by_lower = {c.lower(): c for c in canonical_names} if canonical_names else {}
+
+    for scene in scenes:
+        for block in scene.get("sequence", []):
+            if block.get("type") != "dialogue":
+                continue
+
+            spoken = (block.get("speaker") or "").strip()
+            if spoken and canonical_names and spoken not in canonical_names:
+                spoken_l = spoken.lower()
+                match = canon_by_lower.get(spoken_l)
+                if not match:
+                    for lower_c, canon in canon_by_lower.items():
+                        if re.search(rf"\b{re.escape(lower_c)}\b", spoken_l):
+                            match = canon
+                            break
+                if match:
+                    block["speaker"] = match
+
+            expr = (block.get("expression") or "").strip().lower()
+            if expr not in VALID_EXPRESSIONS:
+                block["expression"] = "neutral"
+            else:
+                block["expression"] = expr
+
+    return scenes
+
+
+def build_asset_manifest(world_bible, speaker_expressions_map, background_ids, provider, api_key, model_name):
+    """Catalogs character/background/cover art descriptions with per-expression variants.
+    Never raises — falls back to a bare-name manifest if the LLM call or JSON parse fails."""
+    speaker_expressions_text = "\n".join(
+        f"- {name}: {', '.join(sorted(exprs)) or 'neutral'}"
+        for name, exprs in sorted(speaker_expressions_map.items())
+    ) or "(none)"
+
     try:
         manifest_raw = call_llm(
             ASSET_MANIFEST_PROMPT.format(
                 world_bible=world_bible,
-                speakers="\n".join(f"- {s}" for s in speaker_names) or "(none)",
+                speaker_expressions=speaker_expressions_text,
                 backgrounds="\n".join(f"- {b}" for b in background_ids) or "(none)"
             ),
             "Output ONLY valid JSON.", provider, api_key, model_name
         )
         asset_manifest = json.loads(clean_json_output(manifest_raw))
-        described_chars = {c.get('name') for c in asset_manifest.get('characters', [])}
+
+        described_chars = {c.get('name'): c for c in asset_manifest.get('characters', [])}
+        for name, used_exprs in speaker_expressions_map.items():
+            char = described_chars.get(name)
+            if not char:
+                asset_manifest.setdefault('characters', []).append({
+                    "name": name,
+                    "base_description": "",
+                    "expressions": [{"id": e, "note": ""} for e in sorted(used_exprs)]
+                })
+                continue
+            char.setdefault("base_description", char.pop("description", "") or "")
+            existing = {e.get('id') for e in char.get('expressions', [])}
+            for e in used_exprs:
+                if e not in existing:
+                    char.setdefault('expressions', []).append({"id": e, "note": ""})
+
         described_bgs = {b.get('id') for b in asset_manifest.get('backgrounds', [])}
-        for name in speaker_names:
-            if name not in described_chars:
-                asset_manifest.setdefault('characters', []).append({"name": name, "description": ""})
         for bg in background_ids:
             if bg not in described_bgs:
                 asset_manifest.setdefault('backgrounds', []).append({"id": bg, "description": ""})
+
+        asset_manifest.setdefault("cover", {"description": ""})
         return asset_manifest, None
+
     except Exception as e:
         fallback = {
-            "characters": [{"name": n, "description": ""} for n in speaker_names],
+            "characters": [
+                {
+                    "name": name,
+                    "base_description": "",
+                    "expressions": [{"id": ex, "note": ""} for ex in sorted(exprs or {"neutral"})]
+                }
+                for name, exprs in sorted(speaker_expressions_map.items())
+            ],
             "backgrounds": [{"id": b, "description": ""} for b in background_ids],
             "cover": {"description": ""}
         }
         return fallback, str(e)
+
 
 def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name):
     """Runs the LLM-as-a-Judge QA stage and returns a scorecard dict. Never raises."""
@@ -448,12 +721,9 @@ def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name
             "evaluated_at": datetime.now(timezone.utc).isoformat(),
         }, str(e)
 
+
 def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name):
-    """Rewrites ONE scene per a targeted creator instruction. Raises on
-    failure — the caller (endpoint) is responsible for turning that into an
-    HTTP error, since (unlike the judge/asset helpers) there's no safe
-    fallback for "the scene the creator asked to fix" other than the
-    unmodified original, which the frontend already has."""
+    """Rewrites ONE scene per a targeted creator instruction."""
     original_id = scene.get("id")
     raw = call_llm(
         TWEAK_PROMPT.format(
@@ -466,9 +736,6 @@ def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name):
     )
     revised = json.loads(clean_json_output(raw))
 
-    # Guardrails: never let the model drift the id or drop/relink to a scene
-    # id that didn't already exist on this scene, since that would silently
-    # break navigation elsewhere in the story.
     revised["id"] = original_id
 
     original_targets = set()
@@ -481,7 +748,6 @@ def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name):
     if revised.get("choices"):
         for c in revised["choices"]:
             if c.get("next_scene") and original_targets and c["next_scene"] not in original_targets:
-                # Model invented a new id — refuse rather than ship a dead link.
                 raise Exception(
                     f"Model invented a new next_scene id ('{c['next_scene']}') that wasn't in the "
                     f"original scene. Try a more specific instruction (e.g. don't ask it to add a "
@@ -493,6 +759,8 @@ def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name):
             f"Model invented a new next_scene_default ('{revised['next_scene_default']}') that wasn't "
             f"in the original scene."
         )
+
+    normalize_speakers([revised], set())
 
     return revised
 
@@ -529,7 +797,11 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
         if match:
             num_chapters = int(match.group())
 
-        update_task('generating', 'Building World Bible...', 5, f"Started {req.provider.upper()} engine. Chapters targeted: {num_chapters}")
+        naming_pool = pick_naming_pool(3)
+
+        update_task('generating', 'Building World Bible...', 5,
+                    f"Started {req.provider.upper()} engine using model '{req.model_name}'. "
+                    f"Chapters targeted: {num_chapters}. Naming pool for this generation: {naming_pool}.")
 
         idea_section = (
             f"- Core Idea (build the plot and world firmly around this creator-provided concept): {req.idea}"
@@ -540,16 +812,15 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
             if req.idea and req.idea.strip() else ""
         )
 
-        # NEW: reference-document ingestion. If the creator attached a draft,
-        # outline, or lore doc, the World/Outline prompts switch into "adapt
-        # this faithfully" mode instead of inventing a fresh plot.
         has_reference = bool(req.reference_text and req.reference_text.strip())
         trimmed_reference = (req.reference_text or "").strip()[:MAX_REFERENCE_CHARS]
         reference_section = (
             f"- A Reference Document has been provided below. Treat it as the AUTHORITATIVE source: "
             f"adapt its plot, characters, and setting faithfully into the World Bible format rather "
             f"than inventing a different story. Only invent details necessary to fill gaps (minor "
-            f"side characters, extra locations) while staying fully consistent with the document.\n\n"
+            f"side characters, extra locations) while staying fully consistent with the document. "
+            f"If the reference already names characters, keep those names AS-IS in the roster (the "
+            f"naming-pool rule above only applies to characters you invent to fill gaps).\n\n"
             f"**Reference Document:**\n{trimmed_reference}\n"
             if has_reference else ""
         )
@@ -565,9 +836,20 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
         world_bible = call_llm(
             WORLD_PROMPT.format(title=req.title, subtitle=req.subtitle, genre=req.genre,
                                  target_length=req.target_length, tone=req.tone,
-                                 idea_section=idea_section, reference_section=reference_section),
+                                 idea_section=idea_section, reference_section=reference_section,
+                                 naming_pool=naming_pool),
             "You are a master visual novel author.", req.provider, req.api_key, req.model_name
         )
+
+        roster_prompt, canonical_names, expressions_by_char = parse_character_roster(world_bible)
+        if canonical_names:
+            update_task('generating', 'World Bible ready.', 15,
+                        f"Roster locked in with {len(canonical_names)} canonical character(s): "
+                        f"{', '.join(sorted(canonical_names))}.")
+        else:
+            update_task('generating', 'World Bible ready.', 15,
+                        "⚠️ No roster block found in World Bible — speaker names won't be normalized. "
+                        "Consider regenerating if you see duplicate characters like 'Amara' and 'Dr. Amara'.")
 
         outline = call_llm(
             OUTLINE_PROMPT.format(target_length=req.target_length, world_bible=world_bible,
@@ -589,7 +871,11 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
             update_task('generating', step_msg, base_prog, step_msg)
 
             prompt = CHAPTER_PROMPT.format(
-                chapter_number=i, world_bible=world_bible, outline=outline, previous_summary=previous_summary
+                chapter_number=i,
+                world_bible=world_bible,
+                outline=outline,
+                previous_summary=previous_summary,
+                roster=roster_prompt,
             )
 
             scenes = []
@@ -601,12 +887,17 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
                     if scenes:
                         update_task('generating', step_msg, base_prog, f"Chapter {i} structured and validated.")
                         break
+                except ModelUnavailableError:
+                    # Model itself is bad — retrying won't help, bail immediately.
+                    raise
                 except Exception as e:
                     update_task('generating', step_msg, base_prog, f"⚠️ Attempt {attempt + 1} Failed (JSON error). Retrying...")
                     time.sleep(2)
 
             if not scenes:
                 raise Exception(f"Failed to generate valid JSON for Chapter {i} after {MAX_RETRIES} attempts.")
+
+            scenes = normalize_speakers(scenes, canonical_names)
 
             if prev_last_scene:
                 target_scene_id = scenes[0]["id"]
@@ -626,10 +917,14 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
             if i < num_chapters:
                 time.sleep(3)
 
-        speaker_names = sorted({
-            block.get('speaker') for scene in all_scenes for block in scene.get('sequence', [])
-            if block.get('speaker')
-        })
+        speaker_expressions_map: dict[str, set[str]] = {}
+        for scene in all_scenes:
+            for block in scene.get("sequence", []):
+                if block.get("type") == "dialogue" and block.get("speaker"):
+                    spk = block["speaker"]
+                    expr = block.get("expression") or "neutral"
+                    speaker_expressions_map.setdefault(spk, set()).add(expr)
+
         background_ids = sorted({
             scene.get('background') for scene in all_scenes if scene.get('background')
         })
@@ -642,11 +937,13 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
         }
 
         update_task('generating', 'Cataloging assets & running AI Judge...', 88,
-                    "Scanning story for unique speakers/settings, and starting the AI Quality Judge in parallel...")
+                    f"Found {len(speaker_expressions_map)} unique speakers across "
+                    f"{sum(len(v) for v in speaker_expressions_map.values())} portrait variants. "
+                    "Starting asset manifest and AI Judge in parallel...")
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             assets_future = executor.submit(
-                build_asset_manifest, world_bible, speaker_names, background_ids,
+                build_asset_manifest, world_bible, speaker_expressions_map, background_ids,
                 req.provider, req.api_key, req.model_name
             )
             judge_future = executor.submit(
@@ -658,10 +955,12 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
 
         if asset_err:
             update_task('generating', 'Asset manifest ready (fallback).', 92,
-                        f"⚠️ Could not auto-describe assets ({asset_err}); showing names only.")
+                        f"⚠️ Could not auto-describe assets ({asset_err}); showing names/expressions only.")
         else:
+            total_variants = sum(len(c.get('expressions', [])) for c in asset_manifest.get('characters', []))
             update_task('generating', 'Asset manifest ready.', 92,
-                        f"Cataloged {len(speaker_names)} characters and {len(background_ids)} backgrounds.")
+                        f"Cataloged {len(asset_manifest.get('characters', []))} characters "
+                        f"({total_variants} portrait variants) and {len(background_ids)} backgrounds.")
 
         if judge_err:
             update_task('generating', 'AI evaluation skipped.', 95,
@@ -697,6 +996,12 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
 
         update_task('completed', 'Ready for review', 100,
                     "✅ Story generated! Play-test it end-to-end to unlock draft saving.")
+
+    except ModelUnavailableError as mue:
+        # Distinct from a generic FATAL ERROR — this one is fully actionable
+        # by the creator (change the model name), so we say so plainly.
+        traceback.print_exc()
+        update_task('failed', 'Model unavailable', 0, f"❌ {str(mue)}")
 
     except Exception as e:
         traceback.print_exc()
@@ -766,12 +1071,7 @@ def evaluate_story_endpoint(task_id: str, req: EvaluateRequest):
 
 @app.post("/tweak-scene")
 def tweak_scene_endpoint(req: TweakSceneRequest):
-    """
-    Rewrites exactly one scene per the creator's instruction. Does not touch
-    Supabase at all — the frontend hot-swaps the returned scene into its own
-    in-memory story state, and the full story is only persisted again if/when
-    the creator explicitly saves a draft.
-    """
+    """Rewrites exactly one scene per the creator's instruction."""
     if not req.scene or not req.scene.get("id"):
         raise HTTPException(status_code=400, detail="Scene payload is missing an 'id'.")
     if not req.instruction or not req.instruction.strip():
@@ -783,6 +1083,10 @@ def tweak_scene_endpoint(req: TweakSceneRequest):
             req.provider, req.api_key, req.model_name
         )
         return {"status": "success", "scene": revised_scene}
+    except ModelUnavailableError as mue:
+        raise HTTPException(status_code=400, detail=str(mue))
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Scene tweak failed: {str(e)}")
+
+    
