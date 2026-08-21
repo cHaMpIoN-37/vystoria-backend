@@ -5,7 +5,6 @@ import time
 import random
 import traceback
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -228,6 +227,8 @@ Using the World Bible provided below, create a high-level outline for the entire
 
 CHAPTER_PROMPT = """
 You are writing Chapter {chapter_number} of the Visual Novel.
+
+**Chapter context:** {chapter_context}
 
 **World Bible:**\n{world_bible}
 **Overall Outline:**\n{outline}
@@ -668,6 +669,130 @@ def normalize_speakers(scenes, canonical_names):
     return scenes
 
 
+def validate_and_repair_scene_graph(all_scenes: list[dict]) -> list[str]:
+    """Walks every next_scene_default and choices[].next_scene reference and
+    makes sure it points at a scene that actually exists in this story. A
+    dangling reference (typo'd id, hallucinated continuation, etc.) is
+    treated as an ending — the field is stripped rather than left pointing
+    at nothing. This is what stops a story from looping back to scene 1 or
+    freezing when it hits a broken link near the end."""
+    valid_ids = {s["id"] for s in all_scenes if s.get("id")}
+    warnings = []
+
+    for scene in all_scenes:
+        sid = scene.get("id", "?")
+
+        default_target = scene.get("next_scene_default")
+        if default_target and default_target not in valid_ids:
+            warnings.append(
+                f"Scene '{sid}': next_scene_default '{default_target}' doesn't exist — "
+                f"treating '{sid}' as an ending instead."
+            )
+            scene.pop("next_scene_default", None)
+
+        if scene.get("choices"):
+            kept = []
+            for choice in scene["choices"]:
+                target = choice.get("next_scene")
+                if target and target in valid_ids:
+                    kept.append(choice)
+                else:
+                    warnings.append(
+                        f"Scene '{sid}': choice '{choice.get('text', '?')}' targets missing "
+                        f"scene '{target}' — removing that choice."
+                    )
+            if kept:
+                scene["choices"] = kept
+            else:
+                scene.pop("choices", None)
+                scene.pop("choice_prompt", None)
+
+    return warnings
+
+
+def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names, num_chapters, update_task, attempt_no):
+    """Runs the chapter-by-chapter generation loop once, start to finish.
+    Returns (all_scenes, starting_scene)."""
+    all_scenes = []
+    starting_scene = None
+    prev_last_scene = None
+    previous_summary = "This is the very beginning."
+    MAX_RETRIES = 3
+
+    for i in range(1, num_chapters + 1):
+        step_msg = f"Writing Chapter {i} of {num_chapters} (attempt {attempt_no})..."
+        base_prog = 25 + int((i / num_chapters) * 55)
+        update_task('generating', step_msg, base_prog, step_msg)
+
+        if i == num_chapters:
+            chapter_context = (
+                f"**IMPORTANT — this is the FINAL chapter ({i} of {num_chapters}).** "
+                "Any scene that represents a true story ending — including the very last "
+                "scene(s) in your 'scenes' array, and any earlier scene an early/bad choice "
+                "leads to that should terminate the story — MUST omit BOTH 'choices' AND "
+                "'next_scene_default' entirely. Do not invent a 'next_scene_default' id for an "
+                "ending scene; a scene with neither field is exactly how the game engine "
+                "recognizes 'The End'. Aim for the 3-5 distinct endings planned in the Outline, "
+                "with at least one reachable via the main path."
+            )
+        else:
+            chapter_context = (
+                f"This is chapter {i} of {num_chapters}. The link from this chapter's final "
+                f"scene to chapter {i + 1}'s opening scene is wired up automatically after you "
+                "submit — just end the final scene linearly with any 'next_scene_default' "
+                "placeholder id; it will be overwritten, so don't worry about it being 'wrong'."
+            )
+
+        prompt = CHAPTER_PROMPT.format(
+            chapter_number=i, chapter_context=chapter_context, world_bible=world_bible,
+            outline=outline, previous_summary=previous_summary, roster=roster_prompt,
+        )
+
+        scenes = []
+        for attempt in range(MAX_RETRIES):
+            try:
+                raw_data = call_llm(prompt, "Output ONLY valid JSON. You MUST escape inner quotes like \\\"this\\\".", req.provider, req.api_key, req.model_name)
+                chapter_data = json.loads(clean_json_output(raw_data))
+                scenes = chapter_data.get("scenes", [])
+                if scenes:
+                    update_task('generating', step_msg, base_prog, f"Chapter {i} structured and validated.")
+                    break
+            except ModelUnavailableError:
+                raise
+            except Exception:
+                update_task('generating', step_msg, base_prog, f"⚠️ Attempt {attempt + 1} Failed (JSON error). Retrying...")
+                time.sleep(2)
+
+        if not scenes:
+            raise Exception(f"Failed to generate valid JSON for Chapter {i} after {MAX_RETRIES} attempts.")
+
+        scenes = normalize_speakers(scenes, canonical_names)
+
+        if prev_last_scene:
+            target_scene_id = scenes[0]["id"]
+            if prev_last_scene.get("choices"):
+                for choice in prev_last_scene["choices"]:
+                    choice["next_scene"] = target_scene_id
+            else:
+                prev_last_scene["next_scene_default"] = target_scene_id
+
+        all_scenes.extend(scenes)
+        prev_last_scene = scenes[-1]
+        previous_summary += f"\nChapter {i} completed."
+
+        if not starting_scene and i == 1:
+            starting_scene = scenes[0]["id"]
+
+        if i < num_chapters:
+            time.sleep(3)
+
+    repair_warnings = validate_and_repair_scene_graph(all_scenes)
+    for w in repair_warnings:
+        update_task('generating', f"Validating story structure (attempt {attempt_no})...", 82, f"⚠️ {w}")
+
+    return all_scenes, (starting_scene or "ch1_scene01")
+
+
 def build_asset_manifest(world_bible, speaker_expressions_map, background_ids, provider, api_key, model_name):
     """Catalogs character/background/cover art descriptions with per-expression variants.
     Never raises — falls back to a bare-name manifest if the LLM call or JSON parse fails."""
@@ -914,65 +1039,53 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
             "You are a master visual novel author.", req.provider, req.api_key, req.model_name
         )
 
+        # The AI Judge is a MANDATORY quality gate now — no frontend toggle.
+        # If the first draft fails, we regenerate the chapters once from the
+        # same World Bible/Outline before giving up and shipping the last draft.
+        MAX_JUDGE_ATTEMPTS = 2  # 1 initial pass + 1 automatic regeneration on FAIL
+
         update_task('generating', 'Writing Chapters...', 25, "Master outline locked in. Beginning chapter pipeline.")
 
-        all_scenes = []
-        starting_scene = None
-        prev_last_scene = None
-        previous_summary = "This is the very beginning."
-        MAX_RETRIES = 3
+        final_story = None
+        evaluation_scorecard = None
+        judge_err = None
+        all_scenes, starting_scene = [], None
 
-        for i in range(1, num_chapters + 1):
-            step_msg = f"Writing Chapter {i} of {num_chapters}..."
-            base_prog = 25 + int((i / num_chapters) * 60)
-            update_task('generating', step_msg, base_prog, step_msg)
-
-            prompt = CHAPTER_PROMPT.format(
-                chapter_number=i,
-                world_bible=world_bible,
-                outline=outline,
-                previous_summary=previous_summary,
-                roster=roster_prompt,
+        for judge_attempt in range(1, MAX_JUDGE_ATTEMPTS + 1):
+            all_scenes, starting_scene = write_all_chapters(
+                req, world_bible, outline, roster_prompt, canonical_names, num_chapters, update_task, judge_attempt
             )
 
-            scenes = []
-            for attempt in range(MAX_RETRIES):
-                try:
-                    raw_data = call_llm(prompt, "Output ONLY valid JSON. You MUST escape inner quotes like \\\"this\\\".", req.provider, req.api_key, req.model_name)
-                    chapter_data = json.loads(clean_json_output(raw_data))
-                    scenes = chapter_data.get("scenes", [])
-                    if scenes:
-                        update_task('generating', step_msg, base_prog, f"Chapter {i} structured and validated.")
-                        break
-                except ModelUnavailableError:
-                    # Model itself is bad — retrying won't help, bail immediately.
-                    raise
-                except Exception as e:
-                    update_task('generating', step_msg, base_prog, f"⚠️ Attempt {attempt + 1} Failed (JSON error). Retrying...")
-                    time.sleep(2)
+            final_story = {
+                "title": f"{req.title}: {req.subtitle}",
+                "starting_scene": starting_scene,
+                "scenes": all_scenes
+            }
 
-            if not scenes:
-                raise Exception(f"Failed to generate valid JSON for Chapter {i} after {MAX_RETRIES} attempts.")
+            update_task('generating', f'Running AI Judge (attempt {judge_attempt}/{MAX_JUDGE_ATTEMPTS})...', 85,
+                        "Submitting the full draft to the AI Judge (mandatory quality gate)...")
+            evaluation_scorecard, judge_err = run_judge_evaluation(world_bible, final_story, req.provider, req.api_key, req.model_name)
 
-            scenes = normalize_speakers(scenes, canonical_names)
+            if judge_err:
+                update_task('generating', 'AI evaluation could not complete.', 87,
+                            f"⚠️ AI Judge could not run automatically ({judge_err}). Proceeding without a passing grade — manual review required.")
+                break
 
-            if prev_last_scene:
-                target_scene_id = scenes[0]["id"]
-                if prev_last_scene.get("choices"):
-                    for choice in prev_last_scene["choices"]:
-                        choice["next_scene"] = target_scene_id
-                else:
-                    prev_last_scene["next_scene_default"] = target_scene_id
+            score = evaluation_scorecard.get('overall_score')
+            if evaluation_scorecard['status'] == 'PASS':
+                update_task('generating', 'AI Judge: PASS', 87,
+                            f"🧑‍⚖️ Judge verdict: PASS" + (f" (Weighted Score: {score}/10)" if score is not None else "") + ".")
+                break
 
-            all_scenes.extend(scenes)
-            prev_last_scene = scenes[-1]
-            previous_summary += f"\nChapter {i} completed."
-
-            if not starting_scene and i == 1:
-                starting_scene = scenes[0]["id"]
-
-            if i < num_chapters:
-                time.sleep(3)
+            if judge_attempt < MAX_JUDGE_ATTEMPTS:
+                update_task('generating', 'AI Judge: FAIL — regenerating', 87,
+                            f"🧑‍⚖️ Judge verdict: FAIL" + (f" (Score: {score}/10)" if score is not None else "")
+                            + f". Failed parameters: {', '.join(evaluation_scorecard.get('failed_parameters', [])) or 'n/a'}. "
+                              f"Regenerating all chapters from the same World Bible...")
+            else:
+                update_task('generating', 'AI Judge: FAIL (max attempts reached)', 87,
+                            f"🧑‍⚖️ Judge verdict: FAIL after {MAX_JUDGE_ATTEMPTS} attempts" + (f" (Score: {score}/10)" if score is not None else "")
+                            + ". Proceeding with the last draft — please review the scorecard and use Tweak Scene to fix specific issues.")
 
         speaker_expressions_map: dict[str, set[str]] = {}
         for scene in all_scenes:
@@ -986,29 +1099,13 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
             scene.get('background') for scene in all_scenes if scene.get('background')
         })
 
-        final_title = f"{req.title}: {req.subtitle}"
-        final_story = {
-            "title": final_title,
-            "starting_scene": starting_scene or "ch1_scene01",
-            "scenes": all_scenes
-        }
-
-        update_task('generating', 'Cataloging assets & running AI Judge...', 88,
+        update_task('generating', 'Cataloging assets...', 90,
                     f"Found {len(speaker_expressions_map)} unique speakers across "
-                    f"{sum(len(v) for v in speaker_expressions_map.values())} portrait variants. "
-                    "Starting asset manifest and AI Judge in parallel...")
+                    f"{sum(len(v) for v in speaker_expressions_map.values())} portrait variants.")
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            assets_future = executor.submit(
-                build_asset_manifest, world_bible, speaker_expressions_map, background_ids,
-                req.provider, req.api_key, req.model_name
-            )
-            judge_future = executor.submit(
-                run_judge_evaluation, world_bible, final_story,
-                req.provider, req.api_key, req.model_name
-            )
-            asset_manifest, asset_err = assets_future.result()
-            evaluation_scorecard, judge_err = judge_future.result()
+        asset_manifest, asset_err = build_asset_manifest(
+            world_bible, speaker_expressions_map, background_ids, req.provider, req.api_key, req.model_name
+        )
 
         if asset_err:
             update_task('generating', 'Asset manifest ready (fallback).', 92,
@@ -1018,16 +1115,6 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
             update_task('generating', 'Asset manifest ready.', 92,
                         f"Cataloged {len(asset_manifest.get('characters', []))} characters "
                         f"({total_variants} portrait variants) and {len(background_ids)} backgrounds.")
-
-        if judge_err:
-            update_task('generating', 'AI evaluation skipped.', 95,
-                        f"⚠️ AI Judge could not complete automatically ({judge_err}). Manual review still required.")
-        else:
-            score = evaluation_scorecard.get('overall_score')
-            update_task('generating', 'AI evaluation complete.', 95,
-                        f"🧑‍⚖️ Judge verdict: {evaluation_scorecard['status']}"
-                        + (f" (Weighted Score: {score}/10)" if score is not None else "")
-                        + ". This is advisory only — review the scorecard and decide for yourself.")
 
         try:
             supabase.table("generation_tasks").update({
