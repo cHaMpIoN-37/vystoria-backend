@@ -3,8 +3,13 @@ import json
 import re
 import time
 import random
+import hmac
+import hashlib
+import secrets
+import smtplib
 import traceback
-from datetime import datetime, timezone
+from email.message import EmailMessage
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -1232,3 +1237,247 @@ def tweak_scene_endpoint(req: TweakSceneRequest):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Scene tweak failed: {str(e)}")
+
+
+
+
+# ==========================================
+# 7. EMAIL OTP / DEFERRED SIGNUP
+# ==========================================
+# The app no longer calls supabase.auth.signInWithOtp(). GoTrue has to INSERT
+# an auth.users row before it has anything to hang a code on, which meant a
+# stranger typing an address into the app created a user. Here the code sits in
+# public.auth_otp_codes (hashed, TTL'd) and auth.users + public.profiles are
+# both born in one shot, after the code checks out, via admin.create_user().
+#
+# The session comes from admin.generate_link(), which mints a one-shot token
+# WITHOUT sending any email. The client trades that hash for a session through
+# supabase.auth.verifyOtp({ token_hash }).
+
+SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT      = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER      = os.environ.get("SMTP_USER")
+SMTP_PASS      = os.environ.get("SMTP_PASS")
+SMTP_FROM      = os.environ.get("SMTP_FROM") or SMTP_USER
+SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Vystoria")
+
+# Peppering means a dump of auth_otp_codes alone can't be brute-forced offline
+# for the 10^6 possible codes.
+OTP_PEPPER         = os.environ.get("OTP_PEPPER") or SUPABASE_SERVICE_KEY
+OTP_TTL_MINUTES    = int(os.environ.get("OTP_TTL_MINUTES", "10"))
+OTP_RESEND_SECONDS = int(os.environ.get("OTP_RESEND_SECONDS", "60"))
+OTP_MAX_ATTEMPTS   = int(os.environ.get("OTP_MAX_ATTEMPTS", "5"))
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class OtpRequest(BaseModel):
+    email: str
+
+
+class OtpVerify(BaseModel):
+    email: str
+    code: str
+
+
+def _normalize_email(raw: str) -> str:
+    email = (raw or "").strip().lower()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    return email
+
+
+def _hash_otp(email: str, code: str) -> str:
+    return hashlib.sha256(f"{OTP_PEPPER}:{email}:{code}".encode("utf-8")).hexdigest()
+
+
+def _lookup_profile(email: str):
+    """public.profiles is the app's definition of 'registered' — a row only
+    exists post-confirmation. Returns None for a first-time address."""
+    res = (
+        supabase.table("profiles")
+        .select("id, full_name")
+        .eq("email", email)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def _send_otp_email(email: str, code: str) -> None:
+    if not SMTP_USER or not SMTP_PASS:
+        raise RuntimeError("SMTP_USER / SMTP_PASS are not configured on the server.")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"{code} is your Vystoria verification code"
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM}>"
+    msg["To"] = email
+    msg.set_content(
+        f"Your Vystoria verification code is {code}.\n\n"
+        f"It expires in {OTP_TTL_MINUTES} minutes. If you didn't ask for it, ignore this email.\n"
+    )
+    msg.add_alternative(
+        f"""<html><body style="font-family:Manrope,Arial,sans-serif;background:#0B0B14;padding:32px;color:#fff">
+              <h2 style="font-family:Georgia,serif;color:#fff;margin:0 0 12px">Vystoria</h2>
+              <p style="color:#C2BBD4;margin:0 0 20px">Here is your verification code.</p>
+              <p style="font-size:34px;letter-spacing:10px;font-weight:700;color:#C48DFF;margin:0 0 20px">{code}</p>
+              <p style="color:#B0A9C4;font-size:13px;margin:0">
+                It expires in {OTP_TTL_MINUTES} minutes. If you didn't request it, you can ignore this email.
+              </p>
+            </body></html>""",
+        subtype="html",
+    )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+
+
+def _mint_session_token(email: str) -> str:
+    """Admin generate_link returns a one-shot hashed token and does NOT send an
+    email. The client exchanges it for a real session."""
+    res = supabase.auth.admin.generate_link({"type": "magiclink", "email": email})
+    props = getattr(res, "properties", None)
+    if props is None and isinstance(res, dict):
+        props = res.get("properties")
+
+    hashed = getattr(props, "hashed_token", None)
+    if hashed is None and isinstance(props, dict):
+        hashed = props.get("hashed_token")
+
+    if not hashed:
+        raise HTTPException(status_code=500, detail="Could not start your session. Please try again.")
+    return hashed
+
+
+@app.post("/auth/request-otp")
+def request_otp_endpoint(req: OtpRequest):
+    """Issues a code. Writes NOTHING to auth.users or public.profiles."""
+    email = _normalize_email(req.email)
+    now = datetime.now(timezone.utc)
+
+    try:
+        supabase.table("auth_otp_codes").delete().lt("expires_at", now.isoformat()).execute()
+
+        existing = (
+            supabase.table("auth_otp_codes")
+            .select("last_sent_at")
+            .eq("email", email)
+            .limit(1)
+            .execute()
+        ).data or []
+
+        if existing and existing[0].get("last_sent_at"):
+            last_sent = datetime.fromisoformat(existing[0]["last_sent_at"].replace("Z", "+00:00"))
+            waited = (now - last_sent).total_seconds()
+            if waited < OTP_RESEND_SECONDS:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Please wait {int(OTP_RESEND_SECONDS - waited)}s before requesting another code.",
+                )
+
+        profile = _lookup_profile(email)
+        code = f"{secrets.randbelow(1_000_000):06d}"
+
+        supabase.table("auth_otp_codes").upsert(
+            {
+                "email": email,
+                "code_hash": _hash_otp(email, code),
+                "expires_at": (now + timedelta(minutes=OTP_TTL_MINUTES)).isoformat(),
+                "attempts": 0,
+                "last_sent_at": now.isoformat(),
+            },
+            on_conflict="email",
+        ).execute()
+
+        try:
+            _send_otp_email(email, code)
+        except Exception:
+            traceback.print_exc()
+            # Don't leave a live code behind for a mail that never went out.
+            supabase.table("auth_otp_codes").delete().eq("email", email).execute()
+            raise HTTPException(status_code=502, detail="We couldn't send the code. Please try again in a moment.")
+
+        # This is what lets the verify screen say the right thing before the
+        # user types anything — no guessing from client-side metadata.
+        return {
+            "is_new_user": profile is None,
+            "display_name": None if profile is None else (profile.get("full_name") or ""),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Could not send the code: {str(e)}")
+
+
+@app.post("/auth/verify-otp")
+def verify_otp_endpoint(req: OtpVerify):
+    """Checks the code and only THEN creates the account."""
+    email = _normalize_email(req.email)
+    code = (req.code or "").strip()
+    if not code.isdigit() or len(code) != 6:
+        raise HTTPException(status_code=400, detail="Enter the 6-digit code from your email.")
+
+    try:
+        rows = (
+            supabase.table("auth_otp_codes")
+            .select("code_hash, expires_at, attempts")
+            .eq("email", email)
+            .limit(1)
+            .execute()
+        ).data or []
+
+        if not rows:
+            raise HTTPException(status_code=400, detail="That code has expired. Please request a new one.")
+
+        row = rows[0]
+        expires_at = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) > expires_at:
+            supabase.table("auth_otp_codes").delete().eq("email", email).execute()
+            raise HTTPException(status_code=400, detail="That code has expired. Please request a new one.")
+
+        if int(row.get("attempts") or 0) >= OTP_MAX_ATTEMPTS:
+            supabase.table("auth_otp_codes").delete().eq("email", email).execute()
+            raise HTTPException(status_code=429, detail="Too many wrong attempts. Please request a new code.")
+
+        if not hmac.compare_digest(row["code_hash"], _hash_otp(email, code)):
+            supabase.table("auth_otp_codes").update(
+                {"attempts": int(row.get("attempts") or 0) + 1}
+            ).eq("email", email).execute()
+            raise HTTPException(status_code=400, detail="That code isn't right. Please check and try again.")
+
+        # Correct — burn it immediately so it can't be replayed.
+        supabase.table("auth_otp_codes").delete().eq("email", email).execute()
+
+        profile = _lookup_profile(email)
+        is_new_user = profile is None
+
+        if is_new_user:
+            try:
+                # email_confirm=True means the row lands already-confirmed, so
+                # the profiles trigger fires on INSERT — the same path Google
+                # OAuth users take. full_name seeds the welcome screen with
+                # something better than the 'Player One' placeholder.
+                supabase.auth.admin.create_user(
+                    {
+                        "email": email,
+                        "email_confirm": True,
+                        "user_metadata": {"full_name": email.split("@")[0]},
+                    }
+                )
+            except Exception as create_error:
+                # An auth.users row with no profiles row (legacy abandoned
+                # signup) is not a failure — just sign them in.
+                if "already" not in str(create_error).lower():
+                    traceback.print_exc()
+                    raise HTTPException(status_code=500, detail="Could not finish setting up your account.")
+
+        return {"token_hash": _mint_session_token(email), "is_new_user": is_new_user}
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)}")        
