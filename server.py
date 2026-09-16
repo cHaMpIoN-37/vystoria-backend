@@ -1292,17 +1292,44 @@ def _hash_otp(email: str, code: str) -> str:
 
 
 def _lookup_profile(email: str):
-    """public.profiles is the app's definition of 'registered' — a row only
-    exists post-confirmation. Returns None for a first-time address."""
+    """public.profiles is the app's definition of 'registered', and
+    onboarded_at is what separates a real account from a Google OAuth row whose
+    owner backed out of the "New to Vystoria?" card. A row with onboarded_at
+    IS NULL has to read as a first-time address here, or the verify screen
+    greets an abandoned signup with "Welcome Back" and request-otp reports the
+    wrong is_new_user."""
     res = (
         supabase.table("profiles")
-        .select("id, full_name")
+        .select("id, full_name, onboarded_at")
         .eq("email", email)
+        .not_.is_("onboarded_at", "null")
         .limit(1)
         .execute()
     )
     rows = res.data or []
     return rows[0] if rows else None
+
+
+def _mark_onboarded(email: str) -> None:
+    """Stamps intent. Idempotent — the .is_(null) filter makes it a no-op for
+    an account that is already onboarded, so it can be called unconditionally.
+
+    Entering a correct code IS the confirmation of intent on the OTP path, so
+    there is no second card to tap. The profiles row is born NULL because the
+    on_auth_user_confirmed trigger fires inside admin.create_user() and knows
+    nothing about which path got us here."""
+    try:
+        (
+            supabase.table("profiles")
+            .update({"onboarded_at": datetime.now(timezone.utc).isoformat()})
+            .eq("email", email)
+            .is_("onboarded_at", "null")
+            .execute()
+        )
+    except Exception:
+        # Never fail a valid login over a UX flag. Worst case the user sees the
+        # new-account card once more and Confirm re-stamps it.
+        traceback.print_exc()
 
 
 def _send_otp_email(email: str, code: str) -> None:
@@ -1469,11 +1496,18 @@ def verify_otp_endpoint(req: OtpVerify):
                     }
                 )
             except Exception as create_error:
-                # An auth.users row with no profiles row (legacy abandoned
-                # signup) is not a failure — just sign them in.
+                # "already registered" now covers a real case, not just legacy
+                # junk: the address has an abandoned Google OAuth row sitting at
+                # onboarded_at IS NULL. Adopting it is correct — the human is
+                # proving ownership of the same mailbox right now.
                 if "already" not in str(create_error).lower():
                     traceback.print_exc()
                     raise HTTPException(status_code=500, detail="Could not finish setting up your account.")
+
+        # Unconditional: heals any straggler (an abandoned Google row just
+        # adopted above, or a legacy account predating the column) and is a
+        # no-op for anyone already stamped.
+        _mark_onboarded(email)
 
         return {"token_hash": _mint_session_token(email), "is_new_user": is_new_user}
     except HTTPException:
