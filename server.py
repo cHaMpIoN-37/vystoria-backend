@@ -6,9 +6,8 @@ import random
 import hmac
 import hashlib
 import secrets
-import smtplib
+import httpx
 import traceback
-from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -1254,12 +1253,18 @@ def tweak_scene_endpoint(req: TweakSceneRequest):
 # WITHOUT sending any email. The client trades that hash for a session through
 # supabase.auth.verifyOtp({ token_hash }).
 
-SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT      = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER      = os.environ.get("SMTP_USER")
-SMTP_PASS      = os.environ.get("SMTP_PASS")
-SMTP_FROM      = os.environ.get("SMTP_FROM") or SMTP_USER
+# Transactional mail goes out over the Brevo HTTPS API, not SMTP. Render's free
+# tier drops outbound connections on ports 25/465/587, so smtplib worked on
+# localhost and then timed out after 20s in production — a 502 that reads
+# exactly like bad credentials. Port 443 is never blocked.
+#
+# Also retires the ~500/day consumer Gmail ceiling, which would have locked
+# every user out for 24 hours on the first real traffic spike.
+BREVO_API_KEY  = os.environ.get("BREVO_API_KEY")
+BREVO_ENDPOINT = "https://api.brevo.com/v3/smtp/email"
+SMTP_FROM      = os.environ.get("SMTP_FROM")
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Vystoria")
+
 
 # Peppering means a dump of auth_otp_codes alone can't be brute-forced offline
 # for the 10^6 possible codes.
@@ -1333,34 +1338,48 @@ def _mark_onboarded(email: str) -> None:
 
 
 def _send_otp_email(email: str, code: str) -> None:
-    if not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError("SMTP_USER / SMTP_PASS are not configured on the server.")
+    """Delivered over HTTPS rather than SMTP — see the note above the config
+    block. Raises on any non-2xx so request_otp_endpoint can delete the code it
+    just wrote: a live code with no email behind it is worse than a clean
+    failure, because the user has no way to ever satisfy it."""
+    if not BREVO_API_KEY:
+        raise RuntimeError("BREVO_API_KEY is not configured on the server.")
+    if not SMTP_FROM:
+        raise RuntimeError("SMTP_FROM is not configured on the server.")
 
-    msg = EmailMessage()
-    msg["Subject"] = f"{code} is your Vystoria verification code"
-    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM}>"
-    msg["To"] = email
-    msg.set_content(
-        f"Your Vystoria verification code is {code}.\n\n"
-        f"It expires in {OTP_TTL_MINUTES} minutes. If you didn't ask for it, ignore this email.\n"
-    )
-    msg.add_alternative(
-        f"""<html><body style="font-family:Manrope,Arial,sans-serif;background:#0B0B14;padding:32px;color:#fff">
+    payload = {
+        "sender": {"email": SMTP_FROM, "name": SMTP_FROM_NAME},
+        "to": [{"email": email}],
+        "subject": f"{code} is your Vystoria verification code",
+        "textContent": (
+            f"Your Vystoria verification code is {code}.\n\n"
+            f"It expires in {OTP_TTL_MINUTES} minutes. If you didn't ask for it, ignore this email.\n"
+        ),
+        "htmlContent": (
+            f"""<html><body style="font-family:Manrope,Arial,sans-serif;background:#0B0B14;padding:32px;color:#fff">
               <h2 style="font-family:Georgia,serif;color:#fff;margin:0 0 12px">Vystoria</h2>
               <p style="color:#C2BBD4;margin:0 0 20px">Here is your verification code.</p>
               <p style="font-size:34px;letter-spacing:10px;font-weight:700;color:#C48DFF;margin:0 0 20px">{code}</p>
               <p style="color:#B0A9C4;font-size:13px;margin:0">
                 It expires in {OTP_TTL_MINUTES} minutes. If you didn't request it, you can ignore this email.
               </p>
-            </body></html>""",
-        subtype="html",
+            </body></html>"""
+        ),
+    }
+
+    # 15s: well inside the client's 45s budget, and far below the 20s smtplib
+    # timeout that was eating the whole request.
+    resp = httpx.post(
+        BREVO_ENDPOINT,
+        headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
+        json=payload,
+        timeout=15.0,
     )
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
-
+    if resp.status_code >= 300:
+        # Surfaced by the traceback.print_exc() that request_otp_endpoint
+        # already runs before raising its 502.
+        raise RuntimeError(f"Brevo rejected the send ({resp.status_code}): {resp.text}")
 
 def _mint_session_token(email: str) -> str:
     """Admin generate_link returns a one-shot hashed token and does NOT send an

@@ -6,3 +6,4 @@ python-dotenv
 google-generativeai
 openai
 anthropic
+httpx>=0.27
