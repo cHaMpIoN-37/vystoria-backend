@@ -487,7 +487,8 @@ Scenes with NO choices should omit "choice_prompt" and "choices" and just use "n
 """
 
 ASSET_MANIFEST_PROMPT = """
-You are cataloging the visual assets needed for a Visual Novel.
+You are the art director and copywriter for a Visual Novel. You are writing the
+brief an illustrator will work from, plus the store blurb players will read.
 
 **World Bible:**
 {world_bible}
@@ -498,30 +499,74 @@ You are cataloging the visual assets needed for a Visual Novel.
 **Background location IDs that actually appear (one entry each, no more/fewer):**
 {backgrounds}
 
-For each character, write ONE base physical/costume description (1-2 sentences, ignoring mood —
-this is what the artist reuses across every expression variant). Then, for each expression
-listed for that character, write a SHORT phrase describing face/posture only (e.g. "brows drawn,
-jaw tight" for angry). The artist will layer the expression on top of the base description.
+═══════════════════════════════════════════════════════════════════
+WHAT TO WRITE
+═══════════════════════════════════════════════════════════════════
 
-For each background ID, write a concise (1-2 sentence) setting description.
-Also write ONE cover art description: a striking, poster-style scene (1-2 sentences) that
-captures the story's tone and would work as a thumbnail/cover image.
+**1. synopsis** — 2 to 3 sentences of back-cover copy, present tense, written to
+make a browsing player tap. Name the protagonist, the world, and the central
+tension. End on the stakes or a hook. NO spoilers past the first act, no
+meta-language ("in this visual novel...", "players will..."), no ending reveals.
+
+**2. art_direction** — ONE sentence naming the house visual style every asset
+shares: medium, line quality, shading, and palette. It is prepended to every
+image prompt, so it must be concrete and reusable. Anchor it to a FLAT 2D
+ILLUSTRATED medium — never photorealism, never 3D rendering.
+Good: "Flat 2D cel-shaded anime illustration, crisp black line art, muted
+teal-and-rust palette with hard-edged shadows and a single warm key light."
+Bad: "Dark and atmospheric." (Not a medium. Not reusable.)
+
+**3. characters** — for each, ONE base description the artist reuses across
+every expression variant. Cover, in this order:
+  - apparent age, build, height, skin tone, hair (colour, length, how it sits)
+  - full outfit head to toe, including footwear, plus fabric and wear/damage
+  - one or two signature props or markings that make them instantly recognisable
+  - their 2-3 colour signature palette
+Describe the person and costume ONLY — never the mood, never the setting,
+never the pose or camera. Those come from the expression note and the
+composition rules. 2 to 3 sentences.
+
+Then, for each expression listed for that character, a SHORT phrase covering
+face and posture only — eyebrows, eyes, mouth, head tilt, shoulders. No
+scenery, no lighting, no clothing.
+
+**4. backgrounds** — for each ID, 2 sentences: the location, the time of day,
+the light source and its direction, and the two or three objects that establish
+the place. Write it as an EMPTY stage. No people, no characters, no animals —
+the cast is composited on top at runtime.
+
+**5. cover** — one poster-style key-art description. A single striking focal
+subject dead centre, readable at thumbnail size. Do NOT describe any lettering,
+title, or logo — the app draws the title itself, and baked-in text renders as
+garbled glyphs.
+
+═══════════════════════════════════════════════════════════════════
+CRITICAL JSON RULES
+═══════════════════════════════════════════════════════════════════
+1. Output ONLY valid JSON. No conversational text before or after.
+2. Escape inner quotes. No trailing commas.
+3. Every character in the speaker list above gets an entry. Every background ID
+   gets an entry. No extras, none missing.
 
 Output ONLY valid JSON in this exact structure:
 {{
+  "synopsis": "Amara has spent six years stitching soldiers back together in a clinic the war forgot. The night a dying courier presses a sealed ledger into her hands, she learns the ceasefire she has been praying for was bought with her own village. Every choice now decides who she becomes when the truth finally surfaces.",
+  "art_direction": "Flat 2D cel-shaded anime illustration, crisp black line art, muted teal-and-rust palette with hard-edged shadows and a single warm key light.",
   "characters": [
     {{
       "name": "Amara",
-      "base_description": "Tall Yoruba woman in a bloodstained field medic's coat, close-cropped hair, silver ear cuff.",
+      "base_description": "Tall Yoruba woman in her early thirties, lean and broad-shouldered, deep brown skin, close-cropped black hair. She wears a field medic's canvas coat over a grey collarless shirt, the coat rust-stained at the cuffs and missing its second button, dark trousers tucked into scuffed leather boots. A silver ear cuff on her left ear and a worn leather satchel across her body. Palette: oxidised teal, dried rust, dull silver.",
       "expressions": [
-        {{ "id": "neutral", "note": "level gaze, mouth relaxed" }},
-        {{ "id": "worried", "note": "brows drawn, lips pressed thin" }},
-        {{ "id": "angry",   "note": "jaw set, eyes narrowed, chin forward" }}
+        {{ "id": "neutral", "note": "level gaze, mouth relaxed, chin slightly lowered" }},
+        {{ "id": "worried", "note": "brows drawn together, lips pressed thin, shoulders tight" }},
+        {{ "id": "angry",   "note": "jaw set, eyes narrowed, chin pushed forward" }}
       ]
     }}
   ],
-  "backgrounds": [ {{ "id": "clinic_night", "description": "..." }} ],
-  "cover": {{ "description": "..." }}
+  "backgrounds": [
+    {{ "id": "clinic_night", "description": "A cramped field clinic after dark, three cots along a sandbagged wall and a shelf of mismatched glass bottles. A single hooded oil lamp hangs low over the centre cot, throwing hard light downward and leaving the corners in deep blue shadow." }}
+  ],
+  "cover": {{ "description": "A lone medic standing centred in a lamplit doorway, a sealed ledger held against her chest, the dark of the war-torn street swallowing the space behind her." }}
 }}
 """
 
@@ -1303,6 +1348,12 @@ def build_asset_manifest(world_bible, speaker_expressions_map, background_ids,
                 asset_manifest.setdefault('backgrounds', []).append({"id": bg, "description": ""})
 
         asset_manifest.setdefault("cover", {"description": ""})
+        # Both ride along in the manifest call — no extra model request.
+        # `synopsis` becomes stories.description (what the player app shows on
+        # the featured card and the detail screen); `art_direction` pre-fills
+        # the House Art Style box so every asset shares one look.
+        asset_manifest.setdefault("synopsis", "")
+        asset_manifest.setdefault("art_direction", "")
         return asset_manifest, None
 
     except (QuotaExhaustedError, ModelUnavailableError):
@@ -1318,7 +1369,9 @@ def build_asset_manifest(world_bible, speaker_expressions_map, background_ids,
                 for name, exprs in sorted(speaker_expressions_map.items())
             ],
             "backgrounds": [{"id": b, "description": ""} for b in background_ids],
-            "cover": {"description": ""}
+            "cover": {"description": ""},
+            "synopsis": "",
+            "art_direction": "",
         }
         return fallback, str(e)
 
@@ -2104,36 +2157,99 @@ def tweak_scene_endpoint(req: TweakSceneRequest):
 # Deliberately a separate provider + key from the text engine. Writing a story
 # on Gemini's free tier and then spending the same 20-request allowance on 40
 # character portraits is exactly how the day's quota disappears.
+# Gemini's image models take a real aspect_ratio setting, so these are exact.
+IMAGE_ASPECTS = {
+    "character":  "3:4",    # tall — the engine draws portraits at h-[80%], bottom-anchored
+    "background": "16:9",   # matches the play area
+    "cover":      "4:3",    # see the safe-zone note in ASPECT_HINTS["cover"]
+}
+
+# OpenAI only offers three sizes, so these are the nearest fit. A cover comes
+# back square rather than 4:3 — which is fine, because the safe-zone rule below
+# already forces the important content into a centred square.
 IMAGE_SIZES = {
     "openai": {
         "character":  "1024x1536",
         "background": "1536x1024",
-        "cover":      "1024x1536",
+        "cover":      "1024x1024",
     },
     "dalle": {
         "character":  "1024x1792",
         "background": "1792x1024",
-        "cover":      "1024x1792",
+        "cover":      "1024x1024",
     },
 }
 
+# Shared negative prompt. The single most common complaint about generated VN
+# art is that it comes back looking like a blurry 3D render with a shallow
+# depth of field — image models default to "cinematic" unless told otherwise.
+# Naming the failure modes explicitly is what stops it.
+FLAT_2D_RULES = (
+    "Flat 2D illustration with clean crisp line art and hard-edged cel shading, "
+    "fully in focus from edge to edge. "
+    "NOT 3D, NOT a render, NOT photorealistic, NOT a photograph. "
+    "No depth-of-field blur, no bokeh, no motion blur, no soft focus, no haze, "
+    "no film grain, no noise, no lens flare, no chromatic aberration, no vignette. "
+    "No text, no lettering, no title, no logo, no watermark, no signature, "
+    "no border, no frame, no UI elements."
+)
+
 ASPECT_HINTS = {
-    "character":  "Full-body character portrait, vertical 2:3 framing, character centered "
-                  "against a FLAT PLAIN background that is easy to cut out, no scenery, "
-                  "no text, no watermark, no border.",
-    "background": "Wide cinematic establishing shot, horizontal 3:2 framing, NO people and "
-                  "NO characters in frame, no text, no watermark.",
-    "cover":      "Poster-style key art, vertical 2:3 framing, dramatic lighting, "
-                  "no text, no title lettering, no watermark.",
+    # Portraits are composited over a background at runtime, so anything behind
+    # the figure is something the creator has to cut out by hand later.
+    "character": (
+        "Full-body character reference of ONE single figure, standing, facing the viewer, "
+        "in a neutral relaxed pose. Vertical 3:4 framing, figure centred, with the whole "
+        "body from the top of the head to the soles of the feet inside the frame and clear "
+        "margin above and below — do not crop the head or the feet. "
+        "COMPLETELY TRANSPARENT BACKGROUND. Nothing at all behind the figure: no scenery, "
+        "no room, no floor, no ground, no cast shadow, no drop shadow, no colour fill, "
+        "no gradient, no backdrop, no props. Clean sharp silhouette edges, ready to cut out "
+        "and composite over a scene. "
+        "One figure only — no turnaround sheet, no multiple poses, no side views, "
+        "no reference grid, no colour swatches, no speech bubbles. "
+        + FLAT_2D_RULES
+    ),
+    # At runtime a dialogue box covers the bottom of the screen and a character
+    # portrait stands on the right, so detail placed there is never seen.
+    "background": (
+        "Empty environment artwork, 16:9 landscape, wide establishing shot at roughly "
+        "eye level. "
+        "ABSOLUTELY NO PEOPLE: no characters, no figures, no silhouettes, no crowds, "
+        "no animals, no faces. This is an empty stage that characters are drawn on top of. "
+        "Compose the important detail in the upper two thirds and the left half of the "
+        "frame: at runtime the bottom third is covered by the dialogue box and the right "
+        "third by a character portrait. Keep those regions visually quiet. "
+        + FLAT_2D_RULES
+    ),
+    # The app crops this to 3:4, 1:1, 8:7 and 16:9 in four different places.
+    # A centred square safe zone is the only composition that survives all four.
+    "cover": (
+        "Poster-style key art, 4:3, with ONE clear focal subject placed dead centre. "
+        "CRITICAL SAFE ZONE: every essential element — the subject's face, the focal "
+        "object, the silhouette — must sit inside a centred square occupying the middle "
+        "of the frame. The app crops this image to tall 3:4, square 1:1 and wide 16:9 in "
+        "different screens, so anything near the left or right edges or the extreme top "
+        "or bottom WILL be cut off. Treat the outer margins as atmosphere only. "
+        "Bold readable silhouette that still works shrunk to a thumbnail. "
+        "Leave the image completely free of lettering — the app draws the title itself. "
+        + FLAT_2D_RULES
+    ),
 }
 
 
 def _compose_image_prompt(req: ImageRequest) -> str:
+    """Subject first, then house style, then composition and negatives.
+
+    Order is deliberate: image models weight the opening of a prompt most
+    heavily, so the thing being drawn leads. The negative-prompt block goes
+    last, where it reads as a constraint on everything above rather than as
+    more subject matter to include."""
     parts = [req.prompt.strip()]
     if req.style and req.style.strip():
-        parts.append(f"Art style: {req.style.strip()}.")
+        parts.append(f"House art style for this entire project: {req.style.strip()}")
     parts.append(ASPECT_HINTS.get(req.kind, ASPECT_HINTS["character"]))
-    return " ".join(parts)
+    return "\n\n".join(parts)
 
 
 def _coerce_image_bytes(data):
@@ -2145,27 +2261,50 @@ def _coerce_image_bytes(data):
     raise Exception("Image payload was neither bytes nor base64 text.")
 
 
-def _gemini_image(api_key, model, prompt):
-    # Preferred: the current google-genai SDK.
+def _gemini_image(api_key, model, prompt, kind="character"):
+    aspect = IMAGE_ASPECTS.get(kind, "1:1")
+
     try:
         from google import genai as google_genai
         from google.genai import types as google_types
 
         client = google_genai.Client(api_key=api_key)
-        resp = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=google_types.GenerateContentConfig(response_modalities=["IMAGE"]),
-        )
-        for part in resp.candidates[0].content.parts:
-            inline = getattr(part, "inline_data", None)
-            if inline and getattr(inline, "data", None):
-                return _coerce_image_bytes(inline.data), (getattr(inline, "mime_type", None) or "image/png")
-        raise Exception("Gemini returned no image part.")
+
+        # image_config lands in different SDK versions at different times, so
+        # try it and fall back to a plain call rather than hard-failing on an
+        # older google-genai. Without it Gemini returns 1:1 and the framing
+        # rules in the prompt are all the composition control we get.
+        config_attempts = []
+        try:
+            config_attempts.append(google_types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                image_config=google_types.ImageConfig(aspect_ratio=aspect),
+            ))
+        except (AttributeError, TypeError):
+            pass
+        config_attempts.append(google_types.GenerateContentConfig(response_modalities=["IMAGE"]))
+
+        last_error = None
+        for config in config_attempts:
+            try:
+                resp = client.models.generate_content(model=model, contents=prompt, config=config)
+                for part in resp.candidates[0].content.parts:
+                    inline = getattr(part, "inline_data", None)
+                    if inline and getattr(inline, "data", None):
+                        return _coerce_image_bytes(inline.data), (getattr(inline, "mime_type", None) or "image/png")
+                last_error = Exception("Gemini returned no image part.")
+            except Exception as e:
+                # A rate limit is terminal — don't burn a second request on the
+                # fallback config just to hit the same wall.
+                if _classify_rate_limit(e):
+                    raise
+                last_error = e
+        raise last_error or Exception("Gemini returned no image part.")
+
     except ImportError:
         pass
 
-    # Fallback: the legacy google-generativeai SDK already in requirements.
+    # Legacy google-generativeai fallback. No aspect-ratio control here.
     import google.generativeai as legacy
     legacy.configure(api_key=api_key)
     resp = legacy.GenerativeModel(model).generate_content(prompt)
@@ -2176,7 +2315,7 @@ def _gemini_image(api_key, model, prompt):
                 return _coerce_image_bytes(inline.data), (getattr(inline, "mime_type", None) or "image/png")
     raise Exception(
         "This Gemini model did not return an image. Use an image-capable model id "
-        f"(e.g. {DEFAULT_IMAGE_MODELS['gemini']}), and `pip install google-genai`."
+        f"(e.g. {DEFAULT_IMAGE_MODELS['gemini']}), and `pip install -U google-genai`."
     )
 
 
@@ -2188,14 +2327,27 @@ def _openai_image(api_key, model, prompt, kind):
     size = IMAGE_SIZES[family].get(kind, "1024x1024")
 
     kwargs = {"model": model, "prompt": prompt, "size": size, "n": 1}
+
     if family == "dalle":
         kwargs["response_format"] = "b64_json"
+    elif kind == "character":
+        # gpt-image-1 can return a genuinely transparent alpha channel, which
+        # is far better than asking for a "plain background" and then cutting a
+        # flat colour out by hand. Requires png (or webp) output.
+        kwargs["background"] = "transparent"
+        kwargs["output_format"] = "png"
 
     try:
         resp = client.images.generate(**kwargs)
     except Exception as e:
-        # Some accounts/models reject a non-square size; one clean retry.
-        if "size" in str(e).lower():
+        msg = str(e).lower()
+        # Older accounts/models reject `background` or `output_format`. Drop the
+        # optional extras and retry once rather than failing the whole request.
+        if "background" in msg or "output_format" in msg:
+            kwargs.pop("background", None)
+            kwargs.pop("output_format", None)
+            resp = client.images.generate(**kwargs)
+        elif "size" in msg:
             kwargs["size"] = "1024x1024"
             resp = client.images.generate(**kwargs)
         else:
@@ -2228,7 +2380,7 @@ def generate_image_endpoint(req: ImageRequest):
     try:
         _throttle(req.api_key)
         if provider == "gemini":
-            image_b64, mime = _gemini_image(req.api_key, model, prompt)
+            image_b64, mime = _gemini_image(req.api_key, model, prompt, req.kind)
         elif provider == "openai":
             image_b64, mime = _openai_image(req.api_key, model, prompt, req.kind)
         else:
