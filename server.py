@@ -331,6 +331,12 @@ class ImageRequest(BaseModel):
     prompt: str
     kind: str = "character"  # character | background | cover — drives aspect ratio
     style: str | None = None # house art-style preset, prepended to every prompt
+    # The creator app composes the full prompt itself (style + format +
+    # composition + negatives) so that its Copy button and its Generate button
+    # produce identical text. When it does, it sends compose=false and we pass
+    # the prompt through untouched. Anything else calling this endpoint can
+    # leave it at the default and still get the rules appended server-side.
+    compose: bool = True
 
 
 class TweakSceneRequest(BaseModel):
@@ -2241,10 +2247,12 @@ ASPECT_HINTS = {
 def _compose_image_prompt(req: ImageRequest) -> str:
     """Subject first, then house style, then composition and negatives.
 
-    Order is deliberate: image models weight the opening of a prompt most
-    heavily, so the thing being drawn leads. The negative-prompt block goes
-    last, where it reads as a constraint on everything above rather than as
-    more subject matter to include."""
+    If the caller already composed the prompt (the creator app does), return it
+    verbatim — appending a second copy of the rules would both waste tokens and
+    let the two wordings drift apart."""
+    if not req.compose:
+        return req.prompt.strip()
+
     parts = [req.prompt.strip()]
     if req.style and req.style.strip():
         parts.append(f"House art style for this entire project: {req.style.strip()}")
