@@ -2,10 +2,12 @@ import os
 import json
 import re
 import time
+import base64
 import random
 import hmac
 import hashlib
 import secrets
+import threading
 import httpx
 import traceback
 from datetime import datetime, timezone, timedelta
@@ -62,17 +64,52 @@ def pick_naming_pool(k: int = 3) -> str:
 
 # Modern, widely-available default model IDs — only used as a fallback when
 # the frontend forgets to send `model_name`. These strings drift every few
-# months as providers retire models, so keep them fresh. The MENTOR-FACING
-# lesson learned: hard-coding a specific model version and shipping it to a
-# fresh account will break whenever the vendor deprecates that model for
-# new users. The frontend now sends a user-editable model string; these are
-# just safety nets.
+# months as providers retire models, so keep them fresh. The frontend sends a
+# user-editable model string; these are just safety nets.
 DEFAULT_MODELS = {
     "gemini": "gemini-3.5-flash",     # stable, replaces the 2.5-flash line
     "openai": "gpt-4o",
     "claude": "claude-sonnet-4-6",    # stable Sonnet 4 tier — broadest availability
     "grok":   "grok-2-latest",
 }
+
+# Image models are a SEPARATE provider+key from the text engine, so a creator
+# can write with (say) OpenAI and draw with Gemini without one eating the
+# other's daily quota.
+DEFAULT_IMAGE_MODELS = {
+    "gemini": "gemini-2.5-flash-image",
+    "openai": "gpt-image-1",
+}
+
+# Output-token ceilings. THE SINGLE BIGGEST SOURCE OF WASTED QUOTA in the old
+# code: no ceiling was ever passed, so a 20-scene chapter would silently hit
+# the provider's default output cap, come back as truncated JSON, and burn
+# three retries producing the same truncation every time.
+MAX_OUTPUT_TOKENS = {
+    "gemini": int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "32768")),
+    "openai": int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "16384")),
+    "claude": int(os.environ.get("CLAUDE_MAX_OUTPUT_TOKENS", "16384")),
+    "grok":   int(os.environ.get("GROK_MAX_OUTPUT_TOKENS", "16384")),
+}
+
+# Minimum wall-clock spacing between two calls made with the SAME api key.
+# Free-tier Gemini is roughly 10 requests/minute; 4s spacing keeps us under
+# that without the creator ever seeing a 429.
+MIN_SECONDS_BETWEEN_CALLS = float(os.environ.get("LLM_MIN_INTERVAL", "4"))
+
+# Back-off policy for *transient* 429s (per-minute RPM/TPM, overload).
+# Daily-quota 429s are never retried — see _classify_rate_limit().
+MAX_RATE_LIMIT_RETRIES = int(os.environ.get("LLM_RATE_LIMIT_RETRIES", "4"))
+RATE_LIMIT_BASE_SLEEP  = float(os.environ.get("LLM_RATE_LIMIT_BASE_SLEEP", "8"))
+MAX_RATE_LIMIT_SLEEP   = float(os.environ.get("LLM_RATE_LIMIT_MAX_SLEEP", "90"))
+
+# Per-chapter attempts. Lower than the old 3 because json_mode + an explicit
+# output ceiling removes almost every reason a chapter used to fail.
+CHAPTER_MAX_RETRIES = int(os.environ.get("CHAPTER_MAX_RETRIES", "2"))
+
+# Bumping this invalidates every stored checkpoint (use when the checkpoint
+# shape changes, so a resume can't half-restore an incompatible payload).
+CHECKPOINT_VERSION = 2
 
 # Substrings we look for inside an SDK exception message to recognize the
 # "the model itself is the problem, not the request" family of failures.
@@ -137,6 +174,107 @@ class ModelUnavailableError(Exception):
     retrying forever on a name that will never resolve."""
 
 
+class RateLimitedError(Exception):
+    """A 429 that a short sleep CAN clear: per-minute request/token caps, or a
+    momentarily overloaded endpoint. Carries the vendor's own suggested wait
+    where one was supplied."""
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class QuotaExhaustedError(Exception):
+    """A ceiling that retrying inside this run CANNOT clear: the free-tier
+    per-day request cap, or the creator's own per-run call budget.
+
+    This is the fix for the reported failure mode. The old code caught a bare
+    Exception around every chapter and retried three times — so a daily-quota
+    429 (which will not succeed again until midnight Pacific) spent THREE
+    requests per chapter proving the same point, ~24 wasted requests against a
+    20/day allowance. Raising a distinct type lets the pipeline stop dead,
+    keep its checkpoint, and tell the creator to come back tomorrow or swap
+    keys."""
+
+
+class TruncatedOutputError(Exception):
+    """The model ran into its output-token ceiling part-way through the JSON.
+    Retrying the identical prompt reproduces it exactly, so the caller shrinks
+    the requested scene count instead of retrying blind."""
+
+
+def _extract_retry_after(text: str):
+    """Pulls a suggested wait out of whatever shape the vendor used.
+    Gemini: `retry_delay { seconds: 22 }` and `Please retry in 22.07s`."""
+    for pattern in (
+        r"retry_delay\s*\{\s*seconds:\s*(\d+)",
+        r"retry in\s*([\d.]+)\s*s",
+        r"try again in\s*([\d.]+)\s*s",
+        r"retry-after[\"']?\s*[:=]\s*([\d.]+)",
+    ):
+        m = re.search(pattern, text or "", re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+    return None
+
+
+RATE_LIMIT_MARKERS = (
+    "429",
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "resource_exhausted",
+    "resource has been exhausted",
+    "too many requests",
+    "exceeded your current quota",
+    "quota exceeded",
+    "overloaded",
+    "please retry in",
+)
+
+# Substrings that mean "this is a PER-DAY ceiling, not a per-minute one".
+# `GenerateRequestsPerDayPerProjectPerModel-FreeTier` lowercases to contain
+# "perday", which is what catches the exact error in the bug report.
+DAILY_QUOTA_MARKERS = (
+    "perday",
+    "per day",
+    "per-day",
+    "requests per day",
+    "daily limit",
+    "daily quota",
+    "free_tier_requests",
+    "generate_content_free_tier_requests",
+    "check your plan and billing",
+    "insufficient_quota",
+)
+
+
+def _classify_rate_limit(exc: Exception):
+    """Returns 'daily', 'transient', or None.
+
+    'daily'     -> QuotaExhaustedError, stop the run, keep the checkpoint.
+    'transient' -> RateLimitedError, sleep and retry.
+    """
+    if exc is None:
+        return None
+
+    low = f"{type(exc).__name__} {exc}".lower()
+    status = next(
+        (str(getattr(exc, a)) for a in ("status_code", "code", "http_status")
+         if getattr(exc, a, None) is not None),
+        "",
+    )
+
+    looks_rate_limited = "429" in status or any(m in low for m in RATE_LIMIT_MARKERS)
+    if not looks_rate_limited:
+        return None
+    if any(m in low for m in DAILY_QUOTA_MARKERS):
+        return "daily"
+    return "transient"
+
+
 # ==========================================
 # 2. DATA MODELS
 # ==========================================
@@ -153,12 +291,47 @@ class GenerateRequest(BaseModel):
     reference_text: str | None = None  # optional creator-supplied story doc / outline
     user_id: str
 
+    # --- quota controls (all optional; safe defaults) ---
+    # 'off'      — skip the judge entirely. Cheapest run possible.
+    # 'advisory' — run it once, record the scorecard, NEVER regenerate. Default.
+    # 'strict'   — the old behaviour: regenerate every chapter once on a FAIL.
+    judge_mode: str = "advisory"
+    # Scenes asked for per chapter. The old hardcoded "18-25" is what kept
+    # overrunning the output ceiling on Flash-tier models.
+    scenes_per_chapter: int = 14
+    # Hard ceiling on model calls for this run. 0 = unlimited.
+    max_llm_calls: int = 0
+
+
 class EvaluateRequest(BaseModel):
     """Lets the creator manually (re-)trigger the AI Judge for an already-generated
     task, e.g. with a different provider/model than was used to write the story."""
     provider: str
     api_key: str
     model_name: str
+
+
+class ResumeRequest(BaseModel):
+    """Restarts a checkpointed task from the last completed chapter. The key
+    and model may differ from the original run — that is the point: a Gemini
+    run that hit the daily wall can be finished on an OpenAI key."""
+    provider: str
+    api_key: str
+    model_name: str
+    judge_mode: str = "advisory"
+    scenes_per_chapter: int = 14
+    max_llm_calls: int = 0
+
+
+class ImageRequest(BaseModel):
+    """One asset, generated on a SEPARATE provider/key from the text engine."""
+    provider: str            # 'gemini' | 'openai'
+    api_key: str
+    model_name: str | None = None
+    prompt: str
+    kind: str = "character"  # character | background | cover — drives aspect ratio
+    style: str | None = None # house art-style preset, prepended to every prompt
+
 
 class TweakSceneRequest(BaseModel):
     """Targeted single-scene rewrite. Only the scene supplied is touched — the
@@ -169,6 +342,7 @@ class TweakSceneRequest(BaseModel):
     world_bible: str
     scene: dict
     instruction: str
+
 
 # ==========================================
 # 3. PROMPT TEMPLATES
@@ -239,7 +413,9 @@ You are writing Chapter {chapter_number} of the Visual Novel.
 **Previous Chapters Summary:**\n{previous_summary}
 **Character Roster (use these EXACT speaker names — see World Bible):**\n{roster}
 
-Write Chapter {chapter_number}. Generate 18-25 scenes.
+Write Chapter {chapter_number}. Generate EXACTLY {scene_count} scenes — no more.
+Do not pad past {scene_count}; running long overflows the output-token limit and
+the whole chapter has to be regenerated.
 
 **DIALOGUE-HEAVY PACING (very important — this is a Visual Novel, not a short story):**
 - Target ratio inside "sequence": ~70% dialogue blocks, ~30% narrative blocks.
@@ -358,8 +534,15 @@ whenever you point something out.
 **World Bible:**
 {world_bible}
 
-**Full Story JSON (all chapters/scenes):**
-{story_json}
+**Machine-computed structural facts (these are measured, not estimated — trust
+them over your own counting, and cite them in your feedback where relevant):**
+{story_stats}
+
+**Story digest.** Every scene is listed with its links and choices. A
+representative sample of scenes is shown with full dialogue and narration;
+the rest are summarized as counts + speakers. Judge prose quality from the
+sampled scenes and structure from the full listing.
+{story_digest}
 
 **PARAMETERS (score each 1-10):**
 
@@ -445,13 +628,21 @@ You are NOT rewriting the story — only this one scene. Do not reference or inv
 Output ONLY the revised scene JSON object, in the same shape as the original.
 """
 
+# Thresholds relaxed. The old bar (overall >= 7.5 AND every single metric at
+# or above its own minimum, with lore_consistency needing 8.0/10) meant one
+# pedantic note about a background id dropped the whole draft — and under the
+# old MAX_JUDGE_ATTEMPTS=2 that cost a SECOND full chapter run, doubling the
+# quota spend of the entire generation. A judge FAIL is now advisory by
+# default; see `judge_mode` on GenerateRequest.
 JUDGE_RUBRIC = {
-    "choice_impact":    {"weight": 0.30, "min_pass": 7.0},
-    "lore_consistency": {"weight": 0.20, "min_pass": 8.0},
-    "tonal_cohesion":   {"weight": 0.20, "min_pass": 7.0},
-    "character_voice":  {"weight": 0.15, "min_pass": 7.0},
+    "choice_impact":    {"weight": 0.30, "min_pass": 6.5},
+    "lore_consistency": {"weight": 0.20, "min_pass": 7.0},
+    "tonal_cohesion":   {"weight": 0.20, "min_pass": 6.5},
+    "character_voice":  {"weight": 0.15, "min_pass": 6.5},
     "narrative_flow":   {"weight": 0.15, "min_pass": 6.0},
 }
+
+JUDGE_PASS_SCORE = float(os.environ.get("JUDGE_PASS_SCORE", "7.0"))
 
 # Whitelist of expression ids we allow the model to use. Anything outside
 # this set gets normalized to "neutral" so the frontend never has to guess
@@ -496,13 +687,59 @@ def _is_model_unavailable(exc: Exception) -> bool:
     return any(marker in low for marker in MODEL_UNAVAILABLE_MARKERS)
 
 
-def call_llm(prompt, system_instruction, provider, api_key, model_name):
+def _openai_style_chat(client, resolved_model, system_instruction, prompt,
+                       max_tokens, temperature, json_mode):
+    """Shared by the 'openai' and 'grok' branches. Handles the two ways newer
+    endpoints reject older kwargs (max_tokens -> max_completion_tokens, and
+    response_format unsupported) without spending an extra generation."""
+    kwargs = {
+        "model": resolved_model,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": max_tokens,
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as e:
+        msg = str(e).lower()
+        retried = False
+        if "max_tokens" in msg and "max_completion_tokens" in msg:
+            kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+            retried = True
+        if "response_format" in msg:
+            kwargs.pop("response_format", None)
+            retried = True
+        if not retried:
+            raise
+        return client.chat.completions.create(**kwargs)
+
+
+def call_llm(prompt, system_instruction, provider, api_key, model_name,
+             *, json_mode=False, max_output_tokens=None, temperature=None):
     """Dynamically routes the prompt to the selected LLM provider.
 
-    All vendor-specific SDK exceptions are caught and re-raised as either
-    ModelUnavailableError (creator needs to change the model name) or plain
-    Exception (transient / retryable). Both carry a message safe to show
-    the creator directly."""
+    Three things changed here versus the old version, all of them quota fixes:
+
+    1. `json_mode` turns on the provider's native structured-output switch
+       (Gemini response_mime_type, OpenAI/Grok response_format, Claude
+       assistant prefill). Most "⚠️ Attempt N Failed (JSON error)" retries in
+       the logs were markdown fences or a chatty preamble — this removes the
+       whole class, and each removed retry is a request back in the budget.
+
+    2. An explicit output ceiling is always sent, and a MAX_TOKENS finish is
+       raised as TruncatedOutputError rather than a generic Exception, so the
+       caller shrinks the ask instead of retrying the identical prompt.
+
+    3. 429s are split into RateLimitedError (sleep + retry) and
+       QuotaExhaustedError (stop, keep the checkpoint, tell the creator).
+    """
     provider = (provider or "").lower()
     resolved_model = (model_name or DEFAULT_MODELS.get(provider) or "").strip()
     if not resolved_model:
@@ -511,67 +748,104 @@ def call_llm(prompt, system_instruction, provider, api_key, model_name):
             f"Try one of: {suggested_alternatives(provider)}."
         )
 
+    max_tokens = int(max_output_tokens or MAX_OUTPUT_TOKENS.get(provider, 8192))
+
     try:
         if provider == 'gemini':
             import google.generativeai as genai
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(resolved_model, system_instruction=system_instruction)
+
+            gen_config = {"max_output_tokens": max_tokens}
+            if temperature is not None:
+                gen_config["temperature"] = temperature
+            if json_mode:
+                gen_config["response_mime_type"] = "application/json"
+
+            model = genai.GenerativeModel(
+                resolved_model,
+                system_instruction=system_instruction,
+                generation_config=gen_config,
+            )
             response = model.generate_content(prompt)
 
             if not response.candidates:
                 raise Exception(
                     f"Gemini returned no candidates. prompt_feedback={getattr(response, 'prompt_feedback', None)}"
                 )
+
             candidate = response.candidates[0]
-            finish_reason = getattr(candidate, 'finish_reason', None)
-            if finish_reason is not None and str(finish_reason) not in ('1', 'STOP', 'FinishReason.STOP'):
+            finish_reason = str(getattr(candidate, 'finish_reason', '') or '')
+
+            if finish_reason in ('2', 'MAX_TOKENS', 'FinishReason.MAX_TOKENS'):
+                raise TruncatedOutputError(
+                    f"Gemini hit its {max_tokens}-token output ceiling before finishing. "
+                    f"The response is incomplete JSON."
+                )
+            if finish_reason and finish_reason not in ('1', 'STOP', 'FinishReason.STOP'):
                 raise Exception(
                     f"Gemini stopped generating early (finish_reason={finish_reason}). "
                     f"This usually means the safety filters blocked the content (common with "
-                    f"dark/violent genres) or max_output_tokens was too low. "
+                    f"dark/violent genres). "
                     f"safety_ratings={getattr(candidate, 'safety_ratings', None)}"
                 )
             return response.text
 
-        elif provider == 'openai':
+        elif provider in ('openai', 'grok'):
             import openai
-            client = openai.OpenAI(api_key=api_key)
-            resp = client.chat.completions.create(
-                model=resolved_model,
-                messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
-            )
-            return resp.choices[0].message.content
+            if provider == 'grok':
+                client = openai.OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
+            else:
+                client = openai.OpenAI(api_key=api_key)
 
-        elif provider == 'grok':
-            import openai
-            client = openai.OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
-            resp = client.chat.completions.create(
-                model=resolved_model,
-                messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
+            resp = _openai_style_chat(
+                client, resolved_model, system_instruction, prompt,
+                max_tokens, temperature, json_mode,
             )
-            return resp.choices[0].message.content
+            choice = resp.choices[0]
+            if getattr(choice, "finish_reason", None) == "length":
+                raise TruncatedOutputError(
+                    f"{provider.title()} hit its {max_tokens}-token output ceiling before finishing."
+                )
+            return choice.message.content
 
         elif provider == 'claude':
             import anthropic
             client = anthropic.Anthropic(api_key=api_key)
-            resp = client.messages.create(
-                model=resolved_model,
-                max_tokens=4000,
-                system=system_instruction,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return resp.content[0].text
+
+            messages = [{"role": "user", "content": prompt}]
+            # Prefilling the assistant turn with "{" is Anthropic's supported
+            # way to force a bare JSON object — no fences, no preamble.
+            if json_mode:
+                messages.append({"role": "assistant", "content": "{"})
+
+            create_kwargs = {
+                "model": resolved_model,
+                "max_tokens": max_tokens,
+                "system": system_instruction,
+                "messages": messages,
+            }
+            if temperature is not None:
+                create_kwargs["temperature"] = temperature
+
+            resp = client.messages.create(**create_kwargs)
+
+            if getattr(resp, "stop_reason", None) == "max_tokens":
+                raise TruncatedOutputError(
+                    f"Claude hit its {max_tokens}-token output ceiling before finishing."
+                )
+
+            text = resp.content[0].text
+            # The prefilled "{" is not echoed back — put it back on.
+            return ("{" + text) if json_mode else text
 
         else:
             raise ValueError(f"Unsupported Provider: {provider}")
 
-    except ModelUnavailableError:
+    except (ModelUnavailableError, TruncatedOutputError,
+            RateLimitedError, QuotaExhaustedError):
         raise
     except Exception as e:
         err_str = str(e)
-        # Log the exception class and any status code, so if this ever misses
-        # a real "model is bad" case we can see exactly what markers to add.
-        # Shows up in Render/uvicorn logs; safe to leave on in production.
         status_hint = next(
             (str(getattr(e, a)) for a in ("status_code", "code", "http_status") if getattr(e, a, None) is not None),
             "no-status"
@@ -579,10 +853,22 @@ def call_llm(prompt, system_instruction, provider, api_key, model_name):
         print(f"[call_llm] {provider}/{resolved_model} raised {type(e).__name__} "
               f"(status={status_hint}): {err_str[:200]}")
 
-        # The specific class of failure the mentor hit: vendor says the model
-        # itself is not available to this account. Repromoting this into a
-        # dedicated exception lets the pipeline give up with a helpful message
-        # instead of retrying three times on a name that will never resolve.
+        # Order matters: check rate limits BEFORE model-availability, because
+        # _is_model_unavailable() casts a deliberately wide net.
+        kind = _classify_rate_limit(e)
+        if kind == "daily":
+            raise QuotaExhaustedError(
+                f"{provider.title()} has cut you off for the rest of the day on model "
+                f"'{resolved_model}' (free-tier daily request cap).\n\n"
+                f"👉 Nothing generated so far is lost — this task is checkpointed. "
+                f"Open it from the Story Library and press Resume once the quota "
+                f"resets (midnight US Pacific for Gemini), or paste a different "
+                f"provider's key in Engine Config and resume on that instead.\n\n"
+                f"Vendor said: {err_str.splitlines()[0][:220]}"
+            ) from e
+        if kind == "transient":
+            raise RateLimitedError(err_str[:300], retry_after=_extract_retry_after(err_str)) from e
+
         if _is_model_unavailable(e):
             first_line = err_str.splitlines()[0][:250] if err_str else "(no detail)"
             raise ModelUnavailableError(
@@ -594,6 +880,112 @@ def call_llm(prompt, system_instruction, provider, api_key, model_name):
                 f"   {suggested_alternatives(provider)}"
             ) from e
         raise
+
+
+# ==========================================
+# 4b. PACING, BUDGET & RETRY WRAPPER
+# ==========================================
+# Every generation now goes through call_llm_guarded() instead of call_llm().
+# It is the single place that owns "how often may we talk to a vendor, and
+# what do we do when they say no".
+_LAST_CALL_AT: dict[str, float] = {}
+_CALL_LOCK = threading.Lock()
+
+
+def _key_fingerprint(api_key: str) -> str:
+    """Never log or key a dict on a raw API key."""
+    return hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _throttle(api_key: str):
+    """Guarantees MIN_SECONDS_BETWEEN_CALLS between two calls on the same key.
+    Free-tier Gemini allows roughly 10 requests/minute; bursting the 8 chapter
+    calls back-to-back is what produced the 'Please retry in 22s' flavour of
+    429 even on days the daily quota was fine."""
+    fp = _key_fingerprint(api_key)
+    with _CALL_LOCK:
+        wait = MIN_SECONDS_BETWEEN_CALLS - (time.time() - _LAST_CALL_AT.get(fp, 0.0))
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_CALL_AT[fp] = time.time()
+
+
+class CallBudget:
+    """A hard ceiling on how many requests ONE generation may spend.
+
+    The point is that the creator finds out from Vystoria, with a clean
+    message and an intact checkpoint, rather than from the vendor with a wall
+    of protobuf. Set it a little under your daily allowance (e.g. 14 against
+    Gemini's free 20) and a runaway retry loop can never drain the day."""
+
+    def __init__(self, limit=0):
+        self.limit = int(limit or 0)
+        self.used = 0
+        self.by_label: dict[str, int] = {}
+
+    def charge(self, label: str):
+        if self.limit and self.used >= self.limit:
+            raise QuotaExhaustedError(
+                f"This run hit its own budget of {self.limit} model calls "
+                f"(spent on: {self.breakdown()}).\n\n"
+                f"👉 Progress is checkpointed. Either raise 'Max model calls' in "
+                f"Engine Config and press Resume, or resume tomorrow."
+            )
+        self.used += 1
+        self.by_label[label] = self.by_label.get(label, 0) + 1
+
+    def breakdown(self) -> str:
+        return ", ".join(f"{k}×{v}" for k, v in sorted(self.by_label.items())) or "nothing"
+
+    def summary(self) -> str:
+        return f"{self.used} model call(s)" + (f" of {self.limit} budgeted" if self.limit else "")
+
+
+def estimate_call_count(num_chapters: int, judge_mode: str) -> int:
+    """What a clean run costs: world bible + outline + N chapters + manifest,
+    plus the judge. Surfaced in the UI before the creator presses go."""
+    calls = 2 + int(num_chapters) + 1
+    if judge_mode != 'off':
+        calls += 1
+    if judge_mode == 'strict':
+        calls += int(num_chapters) + 1   # worst case: one full regeneration
+    return calls
+
+
+def call_llm_guarded(prompt, system_instruction, provider, api_key, model_name,
+                     *, label="call", budget=None, on_log=None, **llm_kwargs):
+    """call_llm + pacing + budget + bounded back-off on transient 429s.
+
+    Deliberately does NOT retry QuotaExhaustedError or ModelUnavailableError —
+    both are terminal for this run, and retrying them is exactly what used to
+    drain the daily allowance."""
+    attempt = 0
+    while True:
+        attempt += 1
+        if budget is not None:
+            budget.charge(label)
+        _throttle(api_key)
+
+        try:
+            return call_llm(prompt, system_instruction, provider, api_key,
+                            model_name, **llm_kwargs)
+
+        except RateLimitedError as rl:
+            if attempt > MAX_RATE_LIMIT_RETRIES:
+                raise QuotaExhaustedError(
+                    f"{provider.title()} kept rate-limiting '{label}' through "
+                    f"{MAX_RATE_LIMIT_RETRIES} back-offs. This is a per-minute cap, not a "
+                    f"daily one, so it should clear shortly.\n\n"
+                    f"👉 Progress is checkpointed — open the task from the Story Library "
+                    f"and press Resume in a few minutes."
+                ) from rl
+
+            delay = rl.retry_after or (RATE_LIMIT_BASE_SLEEP * (2 ** (attempt - 1)))
+            delay = min(delay, MAX_RATE_LIMIT_SLEEP) + random.uniform(0, 2)
+            if on_log:
+                on_log(f"⏳ {provider.title()} rate-limited '{label}'. Waiting {delay:.0f}s "
+                       f"(back-off {attempt}/{MAX_RATE_LIMIT_RETRIES}) — no work lost.")
+            time.sleep(delay)    
 
 def clean_json_output(raw_text):
     """Zero-Regex Brace Counting Algorithm."""
@@ -714,63 +1106,135 @@ def validate_and_repair_scene_graph(all_scenes: list[dict]) -> list[str]:
     return warnings
 
 
-def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names, num_chapters, update_task, attempt_no):
+def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names,
+                       num_chapters, update_task, attempt_no, *, budget=None,
+                       chapters_done=None, on_chapter_done=None,
+                       scenes_per_chapter=14):
     """Runs the chapter-by-chapter generation loop once, start to finish.
+
+    `chapters_done` is a {"1": [scene, ...], "2": [...]} map restored from the
+    task's checkpoint. Any chapter present there is reused verbatim and costs
+    ZERO model calls — this is what makes Resume cheap after a quota wall.
+
+    `on_chapter_done(i, scenes)` is called after each freshly-written chapter
+    so the caller can persist the checkpoint immediately. Losing eight
+    chapters' worth of quota to a 429 on chapter nine was the old behaviour.
+
     Returns (all_scenes, starting_scene)."""
+    chapters_done = dict(chapters_done or {})
     all_scenes = []
     starting_scene = None
     prev_last_scene = None
     previous_summary = "This is the very beginning."
-    MAX_RETRIES = 3
+
 
     for i in range(1, num_chapters + 1):
-        step_msg = f"Writing Chapter {i} of {num_chapters} (attempt {attempt_no})..."
         base_prog = 25 + int((i / num_chapters) * 55)
-        update_task('generating', step_msg, base_prog, step_msg)
+        key = str(i)
 
-        if i == num_chapters:
-            chapter_context = (
-                f"**IMPORTANT — this is the FINAL chapter ({i} of {num_chapters}).** "
-                "Any scene that represents a true story ending — including the very last "
-                "scene(s) in your 'scenes' array, and any earlier scene an early/bad choice "
-                "leads to that should terminate the story — MUST omit BOTH 'choices' AND "
-                "'next_scene_default' entirely. Do not invent a 'next_scene_default' id for an "
-                "ending scene; a scene with neither field is exactly how the game engine "
-                "recognizes 'The End'. Aim for the 3-5 distinct endings planned in the Outline, "
-                "with at least one reachable via the main path."
-            )
+        cached = chapters_done.get(key)
+        if cached:
+            scenes = cached
+            update_task('generating', f"Chapter {i} of {num_chapters} (restored)", base_prog,
+                        f"♻️ Chapter {i} restored from checkpoint — 0 model calls spent.")
         else:
-            chapter_context = (
-                f"This is chapter {i} of {num_chapters}. The link from this chapter's final "
-                f"scene to chapter {i + 1}'s opening scene is wired up automatically after you "
-                "submit — just end the final scene linearly with any 'next_scene_default' "
-                "placeholder id; it will be overwritten, so don't worry about it being 'wrong'."
-            )
+            step_msg = f"Writing Chapter {i} of {num_chapters} (attempt {attempt_no})..."
+            update_task('generating', step_msg, base_prog, step_msg)
 
-        prompt = CHAPTER_PROMPT.format(
-            chapter_number=i, chapter_context=chapter_context, world_bible=world_bible,
-            outline=outline, previous_summary=previous_summary, roster=roster_prompt,
-        )
+            if i == num_chapters:
+                chapter_context = (
+                    f"**IMPORTANT — this is the FINAL chapter ({i} of {num_chapters}).** "
+                    "Any scene that represents a true story ending — including the very last "
+                    "scene(s) in your 'scenes' array, and any earlier scene an early/bad choice "
+                    "leads to that should terminate the story — MUST omit BOTH 'choices' AND "
+                    "'next_scene_default' entirely. Do not invent a 'next_scene_default' id for an "
+                    "ending scene; a scene with neither field is exactly how the game engine "
+                    "recognizes 'The End'. Aim for the 3-5 distinct endings planned in the Outline, "
+                    "with at least one reachable via the main path."
+                )
+            else:
+                chapter_context = (
+                    f"This is chapter {i} of {num_chapters}. The link from this chapter's final "
+                    f"scene to chapter {i + 1}'s opening scene is wired up automatically after you "
+                    "submit — just end the final scene linearly with any 'next_scene_default' "
+                    "placeholder id; it will be overwritten, so don't worry about it being 'wrong'."
+                )
 
-        scenes = []
-        for attempt in range(MAX_RETRIES):
-            try:
-                raw_data = call_llm(prompt, "Output ONLY valid JSON. You MUST escape inner quotes like \\\"this\\\".", req.provider, req.api_key, req.model_name)
-                chapter_data = json.loads(clean_json_output(raw_data))
-                scenes = chapter_data.get("scenes", [])
-                if scenes:
-                    update_task('generating', step_msg, base_prog, f"Chapter {i} structured and validated.")
-                    break
-            except ModelUnavailableError:
-                raise
-            except Exception:
-                update_task('generating', step_msg, base_prog, f"⚠️ Attempt {attempt + 1} Failed (JSON error). Retrying...")
+            target_scenes = int(scenes_per_chapter)
+            scenes = []
+            last_error = None
+
+            for attempt in range(1, CHAPTER_MAX_RETRIES + 1):
+                prompt = CHAPTER_PROMPT.format(
+                    chapter_number=i, chapter_context=chapter_context,
+                    world_bible=world_bible, outline=outline,
+                    previous_summary=previous_summary, roster=roster_prompt,
+                    scene_count=target_scenes,
+                )
+                try:
+                    raw_data = call_llm_guarded(
+                        prompt,
+                        "Output ONLY valid JSON. You MUST escape inner quotes like \\\"this\\\".",
+                        req.provider, req.api_key, req.model_name,
+                        label=f"chapter{i}", budget=budget,
+                        on_log=lambda m: update_task('generating', step_msg, base_prog, m),
+                        json_mode=True,
+                    )
+                    chapter_data = json.loads(clean_json_output(raw_data))
+                    scenes = [s for s in chapter_data.get("scenes", []) if s.get("id")]
+                    if scenes:
+                        update_task('generating', step_msg, base_prog,
+                                    f"Chapter {i} structured and validated ({len(scenes)} scenes).")
+                        break
+                    last_error = "the model returned zero usable scenes"
+
+                except (ModelUnavailableError, QuotaExhaustedError):
+                    # Terminal — never retried. Re-raised so the pipeline can
+                    # checkpoint and stop cleanly instead of burning the day.
+                    raise
+
+                except TruncatedOutputError as te:
+                    last_error = str(te)
+                    target_scenes = max(6, int(target_scenes * 0.6))
+                    update_task('generating', step_msg, base_prog,
+                                f"⚠️ Chapter {i} overran the output-token ceiling. "
+                                f"Retrying with {target_scenes} scenes instead of the full ask.")
+                    continue
+
+                except json.JSONDecodeError as je:
+                    last_error = f"invalid JSON ({je})"
+                    update_task('generating', step_msg, base_prog,
+                                f"⚠️ Chapter {i} attempt {attempt}/{CHAPTER_MAX_RETRIES} "
+                                f"returned malformed JSON. Retrying...")
+
+                except Exception as e:
+                    last_error = str(e)[:200]
+                    update_task('generating', step_msg, base_prog,
+                                f"⚠️ Chapter {i} attempt {attempt}/{CHAPTER_MAX_RETRIES} failed "
+                                f"({last_error}). Retrying...")
+
                 time.sleep(2)
 
-        if not scenes:
-            raise Exception(f"Failed to generate valid JSON for Chapter {i} after {MAX_RETRIES} attempts.")
+            if not scenes:
+                raise Exception(
+                    f"Chapter {i} could not be generated after {CHAPTER_MAX_RETRIES} attempts. "
+                    f"Last error: {last_error}"
+                )
 
-        scenes = normalize_speakers(scenes, canonical_names)
+            # Drop duplicate ids inside the chapter before they can poison the
+            # scene graph (a repeated id makes the player's find() ambiguous).
+            seen_ids, deduped = set(), []
+            for s in scenes:
+                if s["id"] in seen_ids:
+                    continue
+                seen_ids.add(s["id"])
+                deduped.append(s)
+            scenes = deduped
+
+            scenes = normalize_speakers(scenes, canonical_names)
+            chapters_done[key] = scenes
+            if on_chapter_done:
+                on_chapter_done(i, scenes)
 
         if prev_last_scene:
             target_scene_id = scenes[0]["id"]
@@ -787,32 +1251,33 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
         if not starting_scene and i == 1:
             starting_scene = scenes[0]["id"]
 
-        if i < num_chapters:
-            time.sleep(3)
-
     repair_warnings = validate_and_repair_scene_graph(all_scenes)
     for w in repair_warnings:
         update_task('generating', f"Validating story structure (attempt {attempt_no})...", 82, f"⚠️ {w}")
 
     return all_scenes, (starting_scene or "ch1_scene01")
 
-
-def build_asset_manifest(world_bible, speaker_expressions_map, background_ids, provider, api_key, model_name):
+def build_asset_manifest(world_bible, speaker_expressions_map, background_ids,
+                         provider, api_key, model_name, *, budget=None, on_log=None):
     """Catalogs character/background/cover art descriptions with per-expression variants.
-    Never raises — falls back to a bare-name manifest if the LLM call or JSON parse fails."""
+
+    Never raises for ordinary failures — falls back to a bare-name manifest —
+    but a quota wall IS re-raised, because silently degrading to an empty
+    manifest hides the real reason from the creator."""
     speaker_expressions_text = "\n".join(
         f"- {name}: {', '.join(sorted(exprs)) or 'neutral'}"
         for name, exprs in sorted(speaker_expressions_map.items())
     ) or "(none)"
 
     try:
-        manifest_raw = call_llm(
+        manifest_raw = call_llm_guarded(
             ASSET_MANIFEST_PROMPT.format(
                 world_bible=world_bible,
                 speaker_expressions=speaker_expressions_text,
                 backgrounds="\n".join(f"- {b}" for b in background_ids) or "(none)"
             ),
-            "Output ONLY valid JSON.", provider, api_key, model_name
+            "Output ONLY valid JSON.", provider, api_key, model_name,
+            label="asset-manifest", budget=budget, on_log=on_log, json_mode=True,
         )
         asset_manifest = json.loads(clean_json_output(manifest_raw))
 
@@ -840,6 +1305,8 @@ def build_asset_manifest(world_bible, speaker_expressions_map, background_ids, p
         asset_manifest.setdefault("cover", {"description": ""})
         return asset_manifest, None
 
+    except (QuotaExhaustedError, ModelUnavailableError):
+        raise
     except Exception as e:
         fallback = {
             "characters": [
@@ -856,16 +1323,147 @@ def build_asset_manifest(world_bible, speaker_expressions_map, background_ids, p
         return fallback, str(e)
 
 
-def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name):
-    """Runs the LLM-as-a-Judge QA stage and returns a scorecard dict. Never raises."""
+def _reachable_scene_ids(final_story):
+    """BFS from starting_scene. Anything outside the result was written but can
+    never be played — a real defect the judge has no way to notice by reading."""
+    by_id = {s["id"]: s for s in final_story.get("scenes", []) if s.get("id")}
+    start = final_story.get("starting_scene") or next(iter(by_id), None)
+    seen, stack = set(), ([start] if start else [])
+    while stack:
+        sid = stack.pop()
+        if not sid or sid in seen or sid not in by_id:
+            continue
+        seen.add(sid)
+        scene = by_id[sid]
+        if scene.get("next_scene_default"):
+            stack.append(scene["next_scene_default"])
+        for choice in scene.get("choices") or []:
+            stack.append(choice.get("next_scene"))
+    return seen
+
+
+def compute_story_stats(final_story):
+    """Measures everything measurable in Python so the judge doesn't have to
+    count — and can't get the counting wrong. Cheap, deterministic, free."""
+    scenes = final_story.get("scenes", [])
+    all_ids = {s.get("id") for s in scenes if s.get("id")}
+    reachable = _reachable_scene_ids(final_story)
+
+    dialogue = narrative = 0
+    choice_scenes = total_choices = 0
+    generic_prompts = []
+    long_choices = []
+    speakers, expressions, endings = {}, {}, []
+
+    for scene in scenes:
+        for block in scene.get("sequence", []):
+            if block.get("type") == "dialogue":
+                dialogue += 1
+                spk = block.get("speaker") or "(unnamed)"
+                speakers[spk] = speakers.get(spk, 0) + 1
+                exp = block.get("expression") or "neutral"
+                expressions[exp] = expressions.get(exp, 0) + 1
+            else:
+                narrative += 1
+
+        if scene.get("choices"):
+            choice_scenes += 1
+            total_choices += len(scene["choices"])
+            prompt = (scene.get("choice_prompt") or "").strip()
+            if len(prompt) < 20:
+                generic_prompts.append(scene.get("id"))
+            for choice in scene["choices"]:
+                if len((choice.get("text") or "").split()) > 7:
+                    long_choices.append(f'{scene.get("id")}:"{choice.get("text")}"')
+        elif not scene.get("next_scene_default"):
+            endings.append(scene.get("id"))
+
+    total_blocks = (dialogue + narrative) or 1
+    stats = {
+        "scene_count": len(scenes),
+        "dialogue_blocks": dialogue,
+        "narrative_blocks": narrative,
+        "dialogue_ratio": round(dialogue / total_blocks, 3),
+        "choice_scenes": choice_scenes,
+        "total_choices": total_choices,
+        "scenes_per_choice": round(len(scenes) / choice_scenes, 2) if choice_scenes else None,
+        "ending_count": len(endings),
+        "endings": endings[:12],
+        "unreachable_scenes": sorted(all_ids - reachable)[:15],
+        "unreachable_count": len(all_ids - reachable),
+        "speaker_line_counts": dict(sorted(speakers.items(), key=lambda kv: -kv[1])[:15]),
+        "expression_usage": dict(sorted(expressions.items(), key=lambda kv: -kv[1])),
+        "scenes_with_thin_choice_prompt": generic_prompts[:10],
+        "choices_over_7_words": long_choices[:10],
+    }
+    return stats
+
+
+def build_judge_digest(final_story, max_full_scenes=28, max_chars=45000):
+    """Compact, judge-readable rendering of the whole story.
+
+    The old judge received json.dumps() of every scene — on an 8-chapter book
+    that is well past what a Flash-tier model reads reliably, which is why the
+    scorecard so often came back as ERROR or with hallucinated scene ids. Full
+    text for an evenly-spaced sample; one summary line for the rest; every
+    link and choice for all of them."""
+    scenes = final_story.get("scenes", [])
+    if not scenes:
+        return "(story is empty)"
+
+    step = max(1, len(scenes) // max_full_scenes)
+    sampled = set(list(range(0, len(scenes), step))[:max_full_scenes])
+
+    lines = []
+    for idx, scene in enumerate(scenes):
+        header = f"### {scene.get('id')}  [bg: {scene.get('background', '—')}]"
+        sequence = scene.get("sequence", [])
+
+        if idx in sampled:
+            lines.append(header + "   (full text)")
+            for block in sequence:
+                if block.get("type") == "dialogue":
+                    lines.append(f'   {block.get("speaker", "?")} '
+                                 f'({block.get("expression", "neutral")}): {block.get("text", "")}')
+                else:
+                    lines.append(f'   [narration] {block.get("text", "")}')
+        else:
+            d = sum(1 for b in sequence if b.get("type") == "dialogue")
+            n = len(sequence) - d
+            spk = ", ".join(sorted({b.get("speaker") for b in sequence if b.get("speaker")}))
+            lines.append(f"{header}   {d} dialogue / {n} narrative · speakers: {spk or '—'}")
+
+        if scene.get("choices"):
+            lines.append(f'   CHOICE PROMPT: {scene.get("choice_prompt") or "(MISSING)"}')
+            for choice in scene["choices"]:
+                lines.append(f'      -> "{choice.get("text")}"  ==> {choice.get("next_scene")}')
+        elif scene.get("next_scene_default"):
+            lines.append(f'   -> {scene["next_scene_default"]}')
+        else:
+            lines.append("   -> [ENDING]")
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n…(digest truncated)"
+    return text
+
+def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name,
+                         *, budget=None, on_log=None):
+    """Runs the LLM-as-a-Judge QA stage and returns (scorecard, error).
+
+    Never raises for ordinary failures — a judge that can't parse its own JSON
+    must not sink a story that generated fine. Quota walls DO propagate, so
+    the pipeline can checkpoint rather than mislabel the run."""
     try:
-        raw = call_llm(
+        raw = call_llm_guarded(
             JUDGE_PROMPT.format(
                 world_bible=world_bible,
-                story_json=json.dumps(final_story, ensure_ascii=False)
+                story_stats=json.dumps(compute_story_stats(final_story), ensure_ascii=False, indent=2),
+                story_digest=build_judge_digest(final_story),
             ),
             "You are a rigorous, detail-oriented Visual Novel quality judge. Output ONLY valid JSON.",
-            provider, api_key, model_name
+            provider, api_key, model_name,
+            label="judge", budget=budget, on_log=on_log, json_mode=True,
         )
         parsed = json.loads(clean_json_output(raw))
         evaluation = parsed.get("evaluation", parsed)
@@ -885,7 +1483,7 @@ def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name
                 failed_params.append(key)
 
         overall_score = round(weighted_sum / total_weight, 2) if total_weight else None
-        status = "FAIL" if (overall_score is None or overall_score < 7.5 or failed_params) else "PASS"
+        status = "FAIL" if (overall_score is None or overall_score < JUDGE_PASS_SCORE or failed_params) else "PASS"
 
         return {
             "overall_score": overall_score,
@@ -894,8 +1492,12 @@ def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name
             "summary": evaluation.get("summary", ""),
             "metrics": metrics,
             "actionable_critiques": evaluation.get("actionable_critiques", []),
+            "structural_stats": compute_story_stats(final_story),
             "evaluated_at": datetime.now(timezone.utc).isoformat(),
         }, None
+
+    except (QuotaExhaustedError, ModelUnavailableError):
+        raise
     except Exception as e:
         return {
             "overall_score": None,
@@ -904,21 +1506,22 @@ def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name
             "summary": f"AI evaluation could not be completed automatically: {e}",
             "metrics": {},
             "actionable_critiques": [],
+            "structural_stats": compute_story_stats(final_story),
             "evaluated_at": datetime.now(timezone.utc).isoformat(),
         }, str(e)
-
 
 def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name):
     """Rewrites ONE scene per a targeted creator instruction."""
     original_id = scene.get("id")
-    raw = call_llm(
+    raw = call_llm_guarded(
         TWEAK_PROMPT.format(
             world_bible=world_bible or "(none provided)",
             scene_json=json.dumps(scene, ensure_ascii=False),
             instruction=instruction
         ),
         "Output ONLY valid JSON for the single revised scene. Never change 'id' or invent new scene ids.",
-        provider, api_key, model_name
+        provider, api_key, model_name,
+        label="tweak-scene", json_mode=True,
     )
     revised = json.loads(clean_json_output(raw))
 
@@ -953,7 +1556,69 @@ def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name):
 # ==========================================
 # 5. ASYNC BACKGROUND WORKER THREAD
 # ==========================================
-def run_generation_pipeline(task_id: str, req: GenerateRequest):
+
+# ==========================================
+# 5a. CHECKPOINTING
+# ==========================================
+# The whole point: a quota wall on chapter 7 must not cost the six chapters
+# already paid for. Every expensive artifact lands in generation_tasks.checkpoint
+# the moment it exists, and Resume replays from there for free.
+def _load_checkpoint(task_id: str) -> dict:
+    try:
+        res = supabase.table("generation_tasks").select("checkpoint").eq("id", task_id).single().execute()
+        checkpoint = (res.data or {}).get("checkpoint") or {}
+        if checkpoint.get("version") != CHECKPOINT_VERSION:
+            return {}
+        return checkpoint
+    except Exception:
+        traceback.print_exc()
+        return {}
+
+
+def _save_checkpoint(task_id: str, checkpoint: dict):
+    """Writes the full checkpoint plus a SMALL summary column. The frontend
+    polls every 2s and must not drag a megabyte of scene JSON down each time,
+    so it reads checkpoint_progress and never `checkpoint` itself."""
+    checkpoint["version"] = CHECKPOINT_VERSION
+    chapters = checkpoint.get("chapters") or {}
+    summary = {
+        "has_world_bible": bool(checkpoint.get("world_bible")),
+        "has_outline": bool(checkpoint.get("outline")),
+        "chapters_done": len(chapters),
+        "num_chapters": checkpoint.get("num_chapters"),
+        "scenes_banked": sum(len(v or []) for v in chapters.values()),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        supabase.table("generation_tasks").update({
+            "checkpoint": checkpoint,
+            "checkpoint_progress": summary,
+        }).eq("id", task_id).execute()
+    except Exception as db_err:
+        print(f"[{task_id}] ⚠️ Failed to save checkpoint: {db_err}")
+
+
+def _set_failure_kind(task_id: str, kind: str | None):
+    """'quota' unlocks the Resume button in the creator app; 'model' points the
+    creator at Engine Config; None clears it on a fresh start."""
+    try:
+        supabase.table("generation_tasks").update({"failure_kind": kind}).eq("id", task_id).execute()
+    except Exception as db_err:
+        print(f"[{task_id}] ⚠️ Failed to set failure_kind: {db_err}")
+
+
+def run_generation_pipeline(task_id: str, req, resume: bool = False):
+    """Writes one complete visual novel, checkpointing as it goes.
+
+    Call-count arithmetic for an 8-chapter book, which is what made the free
+    tier unusable before:
+
+        old worst case   1 world + 1 outline + (8 × 3 retries) + 1 judge
+                         + 8 regenerated chapters + 1 judge + 1 manifest  ≈ 30+
+        new typical      1 world + 1 outline + 8 chapters + 1 judge
+                         + 1 manifest                                     = 12
+        new, resumed     only the chapters not already in the checkpoint.
+    """
     logs = []
 
     def update_task(status, current_step, progress, log_msg=None, final_url=None):
@@ -965,7 +1630,7 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
             "status": status,
             "current_step": current_step,
             "progress_percent": progress,
-            "logs": logs,
+            "logs": logs[-200:],
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         if final_url:
@@ -977,55 +1642,89 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
             print(f"[{task_id}] ⚠️ Failed to write task update to Supabase: {db_err}")
             traceback.print_exc()
 
+    
+
+    checkpoint = _load_checkpoint(task_id) if resume else {}
+    budget = CallBudget(getattr(req, "max_llm_calls", 0))
+    judge_mode = (getattr(req, "judge_mode", "advisory") or "advisory").lower()
+    scenes_per_chapter = int(getattr(req, "scenes_per_chapter", 14) or 14)
+
+    _set_failure_kind(task_id, None)
+
     try:
-        num_chapters = 8
-        match = re.search(r'\d+', req.target_length)
-        if match:
-            num_chapters = int(match.group())
+        num_chapters = checkpoint.get("num_chapters")
+        if not num_chapters:
+            num_chapters = 8
+            match = re.search(r'\d+', getattr(req, "target_length", "") or "")
+            if match:
+                num_chapters = int(match.group())
 
-        naming_pool = pick_naming_pool(3)
+        chapters_done = checkpoint.get("chapters") or {}
+        estimated = estimate_call_count(num_chapters, judge_mode) - len(chapters_done)
 
-        update_task('generating', 'Building World Bible...', 5,
-                    f"Started {req.provider.upper()} engine using model '{req.model_name}'. "
-                    f"Chapters targeted: {num_chapters}. Naming pool for this generation: {naming_pool}.")
-
-        idea_section = (
-            f"- Core Idea (build the plot and world firmly around this creator-provided concept): {req.idea}"
-            if req.idea and req.idea.strip() else ""
-        )
-        idea_reminder = (
-            f"- Stay faithful to this core idea from the creator: {req.idea}"
-            if req.idea and req.idea.strip() else ""
-        )
-
-        has_reference = bool(req.reference_text and req.reference_text.strip())
-        trimmed_reference = (req.reference_text or "").strip()[:MAX_REFERENCE_CHARS]
-        reference_section = (
-            f"- A Reference Document has been provided below. Treat it as the AUTHORITATIVE source: "
-            f"adapt its plot, characters, and setting faithfully into the World Bible format rather "
-            f"than inventing a different story. Only invent details necessary to fill gaps (minor "
-            f"side characters, extra locations) while staying fully consistent with the document. "
-            f"If the reference already names characters, keep those names AS-IS in the roster (the "
-            f"naming-pool rule above only applies to characters you invent to fill gaps).\n\n"
-            f"**Reference Document:**\n{trimmed_reference}\n"
-            if has_reference else ""
-        )
-        reference_reminder = (
-            "- This outline MUST follow the plot/structure of the Reference Document supplied when "
-            "building the World Bible — do not diverge from it."
-            if has_reference else ""
-        )
-        if has_reference:
+        if resume:
+            update_task('generating', 'Resuming from checkpoint...', 5,
+                        f"♻️ Resuming task. {len(chapters_done)}/{num_chapters} chapters already banked — "
+                        f"about {max(1, estimated)} model call(s) left to pay for.")
+        else:
             update_task('generating', 'Building World Bible...', 5,
-                        f"Reference document detected ({len(trimmed_reference)} chars) — adapting it instead of freeform generation.")
+                        f"Started {req.provider.upper()} engine using model '{req.model_name or '(backend default)'}'. "
+                        f"Chapters: {num_chapters} × {scenes_per_chapter} scenes. Judge: {judge_mode}. "
+                        f"Estimated cost: ~{estimated} model calls"
+                        + (f" (budget {budget.limit})." if budget.limit else "."))
 
-        world_bible = call_llm(
-            WORLD_PROMPT.format(title=req.title, subtitle=req.subtitle, genre=req.genre,
-                                 target_length=req.target_length, tone=req.tone,
-                                 idea_section=idea_section, reference_section=reference_section,
-                                 naming_pool=naming_pool),
-            "You are a master visual novel author.", req.provider, req.api_key, req.model_name
-        )
+        # ---------- WORLD BIBLE ----------
+        world_bible = checkpoint.get("world_bible")
+        naming_pool = checkpoint.get("naming_pool") or pick_naming_pool(3)
+
+        if world_bible:
+            update_task('generating', 'World Bible restored.', 12,
+                        "♻️ World Bible restored from checkpoint — 0 model calls spent.")
+        else:
+            idea_section = (
+                f"- Core Idea (build the plot and world firmly around this creator-provided concept): {req.idea}"
+                if getattr(req, "idea", None) and req.idea.strip() else ""
+            )
+            has_reference = bool(getattr(req, "reference_text", None) and req.reference_text.strip())
+            trimmed_reference = (getattr(req, "reference_text", "") or "").strip()[:MAX_REFERENCE_CHARS]
+            reference_section = (
+                f"- A Reference Document has been provided below. Treat it as the AUTHORITATIVE source: "
+                f"adapt its plot, characters, and setting faithfully into the World Bible format rather "
+                f"than inventing a different story. Only invent details necessary to fill gaps (minor "
+                f"side characters, extra locations) while staying fully consistent with the document. "
+                f"If the reference already names characters, keep those names AS-IS in the roster (the "
+                f"naming-pool rule above only applies to characters you invent to fill gaps).\n\n"
+                f"**Reference Document:**\n{trimmed_reference}\n"
+                if has_reference else ""
+            )
+            if has_reference:
+                update_task('generating', 'Building World Bible...', 5,
+                            f"Reference document detected ({len(trimmed_reference)} chars) — adapting it "
+                            f"instead of freeform generation.")
+
+            world_bible = call_llm_guarded(
+                WORLD_PROMPT.format(title=req.title, subtitle=req.subtitle, genre=req.genre,
+                                    target_length=req.target_length, tone=req.tone,
+                                    idea_section=idea_section, reference_section=reference_section,
+                                    naming_pool=naming_pool),
+                "You are a master visual novel author.",
+                req.provider, req.api_key, req.model_name,
+                label="world-bible", budget=budget,
+                on_log=lambda m: update_task('generating', 'Building World Bible...', 5, m),
+            )
+            checkpoint.update({
+                "world_bible": world_bible,
+                "naming_pool": naming_pool,
+                "num_chapters": num_chapters,
+                "title": req.title,
+                "subtitle": req.subtitle,
+                "genre": req.genre,
+                "target_length": req.target_length,
+                "tone": req.tone,
+                "idea": getattr(req, "idea", None),
+                "reference_text": (getattr(req, "reference_text", "") or "")[:MAX_REFERENCE_CHARS],
+            })
+            _save_checkpoint(task_id, checkpoint)
 
         roster_prompt, canonical_names, expressions_by_char = parse_character_roster(world_bible)
         if canonical_names:
@@ -1034,30 +1733,58 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
                         f"{', '.join(sorted(canonical_names))}.")
         else:
             update_task('generating', 'World Bible ready.', 15,
-                        "⚠️ No roster block found in World Bible — speaker names won't be normalized. "
-                        "Consider regenerating if you see duplicate characters like 'Amara' and 'Dr. Amara'.")
+                        "⚠️ No roster block found in World Bible — speaker names won't be normalized.")
 
-        outline = call_llm(
-            OUTLINE_PROMPT.format(target_length=req.target_length, world_bible=world_bible,
-                                   idea_reminder=idea_reminder, reference_reminder=reference_reminder),
-            "You are a master visual novel author.", req.provider, req.api_key, req.model_name
-        )
+        # ---------- OUTLINE ----------
+        outline = checkpoint.get("outline")
+        if outline:
+            update_task('generating', 'Outline restored.', 22,
+                        "♻️ Outline restored from checkpoint — 0 model calls spent.")
+        else:
+            idea_reminder = (
+                f"- Stay faithful to this core idea from the creator: {req.idea}"
+                if getattr(req, "idea", None) and req.idea.strip() else ""
+            )
+            reference_reminder = (
+                "- This outline MUST follow the plot/structure of the Reference Document supplied when "
+                "building the World Bible — do not diverge from it."
+                if checkpoint.get("reference_text") else ""
+            )
+            outline = call_llm_guarded(
+                OUTLINE_PROMPT.format(target_length=req.target_length, world_bible=world_bible,
+                                      idea_reminder=idea_reminder, reference_reminder=reference_reminder),
+                "You are a master visual novel author.",
+                req.provider, req.api_key, req.model_name,
+                label="outline", budget=budget,
+                on_log=lambda m: update_task('generating', 'Building Outline...', 20, m),
+            )
+            checkpoint["outline"] = outline
+            _save_checkpoint(task_id, checkpoint)
 
-        # The AI Judge is a MANDATORY quality gate now — no frontend toggle.
-        # If the first draft fails, we regenerate the chapters once from the
-        # same World Bible/Outline before giving up and shipping the last draft.
-        MAX_JUDGE_ATTEMPTS = 2  # 1 initial pass + 1 automatic regeneration on FAIL
+        # ---------- CHAPTERS (+ optional strict re-roll) ----------
+        max_judge_attempts = 2 if judge_mode == "strict" else 1
 
-        update_task('generating', 'Writing Chapters...', 25, "Master outline locked in. Beginning chapter pipeline.")
+        update_task('generating', 'Writing Chapters...', 25,
+                    f"Master outline locked in. Beginning chapter pipeline "
+                    f"({len(checkpoint.get('chapters') or {})}/{num_chapters} already banked).")
 
         final_story = None
         evaluation_scorecard = None
         judge_err = None
         all_scenes, starting_scene = [], None
 
-        for judge_attempt in range(1, MAX_JUDGE_ATTEMPTS + 1):
+        def on_chapter_done(index, scenes):
+            checkpoint.setdefault("chapters", {})[str(index)] = scenes
+            _save_checkpoint(task_id, checkpoint)
+
+        for judge_attempt in range(1, max_judge_attempts + 1):
             all_scenes, starting_scene = write_all_chapters(
-                req, world_bible, outline, roster_prompt, canonical_names, num_chapters, update_task, judge_attempt
+                req, world_bible, outline, roster_prompt, canonical_names,
+                num_chapters, update_task, judge_attempt,
+                budget=budget,
+                chapters_done=checkpoint.get("chapters") or {},
+                on_chapter_done=on_chapter_done,
+                scenes_per_chapter=scenes_per_chapter,
             )
 
             final_story = {
@@ -1065,32 +1792,61 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
                 "starting_scene": starting_scene,
                 "scenes": all_scenes
             }
+            checkpoint["final_story"] = final_story
+            _save_checkpoint(task_id, checkpoint)
 
-            update_task('generating', f'Running AI Judge (attempt {judge_attempt}/{MAX_JUDGE_ATTEMPTS})...', 85,
-                        "Submitting the full draft to the AI Judge (mandatory quality gate)...")
-            evaluation_scorecard, judge_err = run_judge_evaluation(world_bible, final_story, req.provider, req.api_key, req.model_name)
+            if judge_mode == "off":
+                update_task('generating', 'Judge skipped', 86,
+                            "⏭️ AI Judge is switched off for this run (Engine Config). "
+                            "Saved one model call.")
+                break
+
+            update_task('generating', f'Running AI Judge (pass {judge_attempt}/{max_judge_attempts})...', 85,
+                        "Submitting a structural digest of the draft to the AI Judge...")
+            evaluation_scorecard, judge_err = run_judge_evaluation(
+                world_bible, final_story, req.provider, req.api_key, req.model_name,
+                budget=budget, on_log=lambda m: update_task('generating', 'Running AI Judge...', 85, m),
+            )
 
             if judge_err:
                 update_task('generating', 'AI evaluation could not complete.', 87,
-                            f"⚠️ AI Judge could not run automatically ({judge_err}). Proceeding without a passing grade — manual review required.")
+                            f"⚠️ AI Judge could not run ({judge_err}). The story itself is fine — "
+                            f"re-run the judge from the AI Judgement screen whenever you like.")
                 break
 
             score = evaluation_scorecard.get('overall_score')
             if evaluation_scorecard['status'] == 'PASS':
                 update_task('generating', 'AI Judge: PASS', 87,
-                            f"🧑‍⚖️ Judge verdict: PASS" + (f" (Weighted Score: {score}/10)" if score is not None else "") + ".")
+                            f"🧑‍⚖️ Judge verdict: PASS"
+                            + (f" (Weighted Score: {score}/10)" if score is not None else "") + ".")
                 break
 
-            if judge_attempt < MAX_JUDGE_ATTEMPTS:
+            failed = ', '.join(evaluation_scorecard.get('failed_parameters', [])) or 'n/a'
+            if judge_mode != "strict":
+                update_task('generating', 'AI Judge: FAIL (advisory)', 87,
+                            f"🧑‍⚖️ Judge verdict: FAIL"
+                            + (f" (Score: {score}/10)" if score is not None else "")
+                            + f". Weak parameters: {failed}. Advisory mode — the draft is kept as-is. "
+                              f"Use Tweak Scene on the specific scenes named in the critiques instead "
+                              f"of paying for a whole regeneration.")
+                break
+
+            if judge_attempt < max_judge_attempts:
+                # Strict mode only: throw the chapters away and re-roll.
+                checkpoint["chapters"] = {}
+                _save_checkpoint(task_id, checkpoint)
                 update_task('generating', 'AI Judge: FAIL — regenerating', 87,
-                            f"🧑‍⚖️ Judge verdict: FAIL" + (f" (Score: {score}/10)" if score is not None else "")
-                            + f". Failed parameters: {', '.join(evaluation_scorecard.get('failed_parameters', [])) or 'n/a'}. "
-                              f"Regenerating all chapters from the same World Bible...")
+                            f"🧑‍⚖️ Judge verdict: FAIL"
+                            + (f" (Score: {score}/10)" if score is not None else "")
+                            + f". Weak parameters: {failed}. Strict mode — regenerating all chapters "
+                              f"(this costs another {num_chapters} model calls).")
             else:
                 update_task('generating', 'AI Judge: FAIL (max attempts reached)', 87,
-                            f"🧑‍⚖️ Judge verdict: FAIL after {MAX_JUDGE_ATTEMPTS} attempts" + (f" (Score: {score}/10)" if score is not None else "")
-                            + ". Proceeding with the last draft — please review the scorecard and use Tweak Scene to fix specific issues.")
+                            f"🧑‍⚖️ Judge verdict: FAIL after {max_judge_attempts} attempts"
+                            + (f" (Score: {score}/10)" if score is not None else "")
+                            + ". Proceeding with the last draft — review the scorecard and use Tweak Scene.")
 
+        # ---------- ASSET MANIFEST ----------
         speaker_expressions_map: dict[str, set[str]] = {}
         for scene in all_scenes:
             for block in scene.get("sequence", []):
@@ -1107,9 +1863,20 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
                     f"Found {len(speaker_expressions_map)} unique speakers across "
                     f"{sum(len(v) for v in speaker_expressions_map.values())} portrait variants.")
 
-        asset_manifest, asset_err = build_asset_manifest(
-            world_bible, speaker_expressions_map, background_ids, req.provider, req.api_key, req.model_name
-        )
+        asset_manifest = checkpoint.get("asset_manifest")
+        asset_err = None
+        if asset_manifest:
+            update_task('generating', 'Asset manifest restored.', 92,
+                        "♻️ Asset manifest restored from checkpoint — 0 model calls spent.")
+        else:
+            asset_manifest, asset_err = build_asset_manifest(
+                world_bible, speaker_expressions_map, background_ids,
+                req.provider, req.api_key, req.model_name,
+                budget=budget,
+                on_log=lambda m: update_task('generating', 'Cataloging assets...', 90, m),
+            )
+            checkpoint["asset_manifest"] = asset_manifest
+            _save_checkpoint(task_id, checkpoint)
 
         if asset_err:
             update_task('generating', 'Asset manifest ready (fallback).', 92,
@@ -1120,6 +1887,7 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
                         f"Cataloged {len(asset_manifest.get('characters', []))} characters "
                         f"({total_variants} portrait variants) and {len(background_ids)} backgrounds.")
 
+        # ---------- PERSIST ----------
         try:
             supabase.table("generation_tasks").update({
                 "result_json": final_story,
@@ -1139,21 +1907,38 @@ def run_generation_pipeline(task_id: str, req: GenerateRequest):
         except Exception as db_err:
             traceback.print_exc()
             update_task('generating', 'Evaluation not saved', 97,
-                        f"⚠️ Story saved fine, but couldn't save the AI Judge scorecard "
-                        f"(have you run supabase_migration_add_evaluation.sql?): {db_err}")
+                        f"⚠️ Story saved fine, but couldn't save the AI Judge scorecard: {db_err}")
 
         update_task('completed', 'Ready for review', 100,
-                    "✅ Story generated! Play-test it end-to-end to unlock draft saving.")
+                    f"✅ Story generated in {budget.summary()} ({budget.breakdown()}). "
+                    f"Play-test it end-to-end to unlock publishing.")
+
+    except QuotaExhaustedError as qee:
+        # The headline fix. Everything paid for so far is already in the
+        # checkpoint, so this is a pause, not a loss.
+        traceback.print_exc()
+        _save_checkpoint(task_id, checkpoint)
+        _set_failure_kind(task_id, "quota")
+        banked = len((checkpoint.get("chapters") or {}))
+        update_task('failed', 'Paused — provider quota reached', 0,
+                    f"⏸️ {str(qee)}\n\nCheckpoint holds "
+                    f"{'a World Bible, ' if checkpoint.get('world_bible') else ''}"
+                    f"{'an Outline, ' if checkpoint.get('outline') else ''}"
+                    f"{banked} finished chapter(s). Spent this run: {budget.summary()}.")
 
     except ModelUnavailableError as mue:
-        # Distinct from a generic FATAL ERROR — this one is fully actionable
-        # by the creator (change the model name), so we say so plainly.
         traceback.print_exc()
+        _save_checkpoint(task_id, checkpoint)
+        _set_failure_kind(task_id, "model")
         update_task('failed', 'Model unavailable', 0, f"❌ {str(mue)}")
 
     except Exception as e:
         traceback.print_exc()
-        update_task('failed', 'Error occurred', 0, f"❌ FATAL ERROR: {str(e)}")
+        _save_checkpoint(task_id, checkpoint)
+        _set_failure_kind(task_id, "other")
+        update_task('failed', 'Error occurred', 0,
+                    f"❌ FATAL ERROR: {str(e)}\n\nAnything already generated is checkpointed — "
+                    f"press Resume rather than starting over.")
 
 # ==========================================
 # 6. API ENDPOINTS
@@ -1172,7 +1957,10 @@ def generate_story_endpoint(req: GenerateRequest, background_tasks: BackgroundTa
             "title": f"{req.title}: {req.subtitle}",
             "provider": req.provider,
             "status": "pending",
-            "current_step": "Initializing..."
+            "current_step": "Initializing...",
+            "checkpoint": None,
+            "checkpoint_progress": None,
+            "failure_kind": None,
         }).execute()
 
         if not res.data:
@@ -1183,13 +1971,84 @@ def generate_story_endpoint(req: GenerateRequest, background_tasks: BackgroundTa
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to create generation task: {str(e)}")
 
-    background_tasks.add_task(run_generation_pipeline, task_id, req)
+    background_tasks.add_task(run_generation_pipeline, task_id, req, False)
+
+    num_chapters = 8
+    match = re.search(r'\d+', req.target_length or "")
+    if match:
+        num_chapters = int(match.group())
 
     return {
         "status": "success",
         "message": "Generation task started in the background.",
-        "task_id": task_id
+        "task_id": task_id,
+        "estimated_calls": estimate_call_count(num_chapters, req.judge_mode),
     }
+
+
+@app.post("/resume/{task_id}")
+def resume_story_endpoint(task_id: str, req: ResumeRequest, background_tasks: BackgroundTasks):
+    """Picks a checkpointed task back up. The provider/key/model may be
+    different from the original run — which is the whole point when the
+    original key is out of quota for the day."""
+    try:
+        res = supabase.table("generation_tasks").select(
+            "id, title, checkpoint, status"
+        ).eq("id", task_id).single().execute()
+        row = res.data
+        if not row:
+            raise HTTPException(status_code=404, detail="No such generation task.")
+
+        checkpoint = row.get("checkpoint") or {}
+        if checkpoint.get("version") != CHECKPOINT_VERSION or not checkpoint.get("world_bible"):
+            raise HTTPException(
+                status_code=400,
+                detail="This task has no usable checkpoint — nothing to resume from. "
+                       "Start a fresh generation instead."
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Could not load the task: {str(e)}")
+
+    # Rebuild a request object out of the checkpoint so the original brief is
+    # honoured even though the caller only sent credentials.
+    resume_req = GenerateRequest(
+        provider=req.provider,
+        api_key=req.api_key,
+        model_name=req.model_name,
+        title=checkpoint.get("title") or (row.get("title") or "Untitled").split(":")[0].strip(),
+        subtitle=checkpoint.get("subtitle") or "",
+        genre=checkpoint.get("genre") or "",
+        target_length=checkpoint.get("target_length") or f"{checkpoint.get('num_chapters', 8)} chapters",
+        tone=checkpoint.get("tone") or "",
+        idea=checkpoint.get("idea"),
+        reference_text=checkpoint.get("reference_text"),
+        user_id="",  # unused on resume — the row already exists
+        judge_mode=req.judge_mode,
+        scenes_per_chapter=req.scenes_per_chapter,
+        max_llm_calls=req.max_llm_calls,
+    )
+
+    supabase.table("generation_tasks").update({
+        "status": "pending",
+        "current_step": "Resuming...",
+        "failure_kind": None,
+        "provider": req.provider,
+    }).eq("id", task_id).execute()
+
+    background_tasks.add_task(run_generation_pipeline, task_id, resume_req, True)
+
+    done = len(checkpoint.get("chapters") or {})
+    total = checkpoint.get("num_chapters") or 8
+    return {
+        "status": "success",
+        "task_id": task_id,
+        "chapters_restored": done,
+        "chapters_remaining": max(0, total - done),
+    }
+
 
 @app.post("/evaluate/{task_id}")
 def evaluate_story_endpoint(task_id: str, req: EvaluateRequest):
@@ -1203,7 +2062,8 @@ def evaluate_story_endpoint(task_id: str, req: EvaluateRequest):
         final_story = row["result_json"]
 
         evaluation_scorecard, judge_err = run_judge_evaluation(
-            world_bible, final_story, req.provider, req.api_key, req.model_name
+            world_bible, final_story, req.provider, req.api_key, req.model_name,
+            budget=CallBudget(5),   # a manual re-run should never spiral
         )
 
         supabase.table("generation_tasks").update({
@@ -1238,6 +2098,178 @@ def tweak_scene_endpoint(req: TweakSceneRequest):
         raise HTTPException(status_code=500, detail=f"Scene tweak failed: {str(e)}")
 
 
+# ==========================================
+# 6b. ASSET IMAGE GENERATION
+# ==========================================
+# Deliberately a separate provider + key from the text engine. Writing a story
+# on Gemini's free tier and then spending the same 20-request allowance on 40
+# character portraits is exactly how the day's quota disappears.
+IMAGE_SIZES = {
+    "openai": {
+        "character":  "1024x1536",
+        "background": "1536x1024",
+        "cover":      "1024x1536",
+    },
+    "dalle": {
+        "character":  "1024x1792",
+        "background": "1792x1024",
+        "cover":      "1024x1792",
+    },
+}
+
+ASPECT_HINTS = {
+    "character":  "Full-body character portrait, vertical 2:3 framing, character centered "
+                  "against a FLAT PLAIN background that is easy to cut out, no scenery, "
+                  "no text, no watermark, no border.",
+    "background": "Wide cinematic establishing shot, horizontal 3:2 framing, NO people and "
+                  "NO characters in frame, no text, no watermark.",
+    "cover":      "Poster-style key art, vertical 2:3 framing, dramatic lighting, "
+                  "no text, no title lettering, no watermark.",
+}
+
+
+def _compose_image_prompt(req: ImageRequest) -> str:
+    parts = [req.prompt.strip()]
+    if req.style and req.style.strip():
+        parts.append(f"Art style: {req.style.strip()}.")
+    parts.append(ASPECT_HINTS.get(req.kind, ASPECT_HINTS["character"]))
+    return " ".join(parts)
+
+
+def _coerce_image_bytes(data):
+    """Different SDK versions hand back raw bytes or an already-base64 str."""
+    if isinstance(data, bytes):
+        return base64.b64encode(data).decode("utf-8")
+    if isinstance(data, str):
+        return data
+    raise Exception("Image payload was neither bytes nor base64 text.")
+
+
+def _gemini_image(api_key, model, prompt):
+    # Preferred: the current google-genai SDK.
+    try:
+        from google import genai as google_genai
+        from google.genai import types as google_types
+
+        client = google_genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=google_types.GenerateContentConfig(response_modalities=["IMAGE"]),
+        )
+        for part in resp.candidates[0].content.parts:
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                return _coerce_image_bytes(inline.data), (getattr(inline, "mime_type", None) or "image/png")
+        raise Exception("Gemini returned no image part.")
+    except ImportError:
+        pass
+
+    # Fallback: the legacy google-generativeai SDK already in requirements.
+    import google.generativeai as legacy
+    legacy.configure(api_key=api_key)
+    resp = legacy.GenerativeModel(model).generate_content(prompt)
+    for candidate in resp.candidates or []:
+        for part in candidate.content.parts:
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                return _coerce_image_bytes(inline.data), (getattr(inline, "mime_type", None) or "image/png")
+    raise Exception(
+        "This Gemini model did not return an image. Use an image-capable model id "
+        f"(e.g. {DEFAULT_IMAGE_MODELS['gemini']}), and `pip install google-genai`."
+    )
+
+
+def _openai_image(api_key, model, prompt, kind):
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+
+    family = "dalle" if "dall-e" in (model or "").lower() else "openai"
+    size = IMAGE_SIZES[family].get(kind, "1024x1024")
+
+    kwargs = {"model": model, "prompt": prompt, "size": size, "n": 1}
+    if family == "dalle":
+        kwargs["response_format"] = "b64_json"
+
+    try:
+        resp = client.images.generate(**kwargs)
+    except Exception as e:
+        # Some accounts/models reject a non-square size; one clean retry.
+        if "size" in str(e).lower():
+            kwargs["size"] = "1024x1024"
+            resp = client.images.generate(**kwargs)
+        else:
+            raise
+
+    item = resp.data[0]
+    if getattr(item, "b64_json", None):
+        return item.b64_json, "image/png"
+    if getattr(item, "url", None):
+        fetched = httpx.get(item.url, timeout=60.0)
+        fetched.raise_for_status()
+        return base64.b64encode(fetched.content).decode("utf-8"), "image/png"
+    raise Exception("OpenAI returned neither b64_json nor a url.")
+
+
+@app.post("/generate-image")
+def generate_image_endpoint(req: ImageRequest):
+    """Returns one image as base64. The CREATOR APP uploads it to Supabase
+    Storage through its existing asset path, so storage layout, draft_assets
+    bookkeeping and RLS all stay in exactly one place."""
+    if not req.prompt or not req.prompt.strip():
+        raise HTTPException(status_code=400, detail="Nothing to draw — this asset has no description yet.")
+    if not req.api_key:
+        raise HTTPException(status_code=400, detail="No image API key configured. Set one in Engine Config → Asset Art.")
+
+    provider = (req.provider or "gemini").lower()
+    model = (req.model_name or DEFAULT_IMAGE_MODELS.get(provider) or "").strip()
+    prompt = _compose_image_prompt(req)
+
+    try:
+        _throttle(req.api_key)
+        if provider == "gemini":
+            image_b64, mime = _gemini_image(req.api_key, model, prompt)
+        elif provider == "openai":
+            image_b64, mime = _openai_image(req.api_key, model, prompt, req.kind)
+        else:
+            raise HTTPException(status_code=400, detail=f"'{provider}' can't generate images. Use gemini or openai.")
+
+        return {"status": "success", "image_base64": image_b64, "mime_type": mime,
+                "model": model, "prompt_used": prompt}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        kind = _classify_rate_limit(e)
+        if kind == "daily":
+            # "limit: 0" is a different animal from "you used your allowance":
+            # the model is not on this account's tier at all, so waiting for
+            # the daily reset achieves nothing. Say so, or the creator sits
+            # there until midnight for a wall that never moves.
+            never_allowed = re.search(r"limit:\s*0\b", str(e)) is not None
+            if never_allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"'{model}' isn't available on this {provider} account's free tier "
+                           f"(the quota for it is zero, not just used up — waiting won't help).\n\n"
+                           f"👉 Enable billing on the key's project, or switch Engine Config → "
+                           f"Asset Art to a provider whose key is on a paid plan. The Copy button "
+                           f"on each tile still works for pasting into an external image tool."
+                )
+            raise HTTPException(
+                status_code=429,
+                detail=f"The image key has used up its daily quota on {provider}. "
+                       f"Upload art manually for now, or switch the Asset Art provider in Engine Config."
+            )
+        if kind == "transient":
+            wait = _extract_retry_after(str(e))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Image provider is rate-limiting"
+                       + (f" — try again in about {int(wait)}s." if wait else " — try again shortly.")
+            )
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
 
 
 # ==========================================
