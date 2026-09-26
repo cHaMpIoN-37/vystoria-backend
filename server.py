@@ -81,6 +81,17 @@ DEFAULT_IMAGE_MODELS = {
     "openai": "gpt-image-1",
 }
 
+# Explicit, stated fallback order for the AI Judge specifically. All entries
+# stay on the SAME provider (the creator only supplies one key), so this is
+# "if this model is down, try a known-stable one on the same account" — not
+# a cross-vendor fallback. See run_judge_evaluation_with_fallback().
+JUDGE_MODEL_FALLBACKS = {
+    "gemini": ["gemini-3.5-flash", "gemini-3.1-flash-lite"],
+    "openai": ["gpt-4o", "gpt-4o-mini"],
+    "claude": ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    "grok":   ["grok-2-latest", "grok-2-beta"],
+}
+
 # Output-token ceilings. THE SINGLE BIGGEST SOURCE OF WASTED QUOTA in the old
 # code: no ceiling was ever passed, so a 20-scene chapter would silently hit
 # the provider's default output cap, come back as truncated JSON, and burn
@@ -106,6 +117,12 @@ MAX_RATE_LIMIT_SLEEP   = float(os.environ.get("LLM_RATE_LIMIT_MAX_SLEEP", "90"))
 # Per-chapter attempts. Lower than the old 3 because json_mode + an explicit
 # output ceiling removes almost every reason a chapter used to fail.
 CHAPTER_MAX_RETRIES = int(os.environ.get("CHAPTER_MAX_RETRIES", "2"))
+
+# Below this many combined dialogue+narration words, a scene reads as a stub
+# even if it's structurally valid. Flagged in compute_story_stats() and
+# turned into a hard Judge FAIL in run_judge_evaluation() — mirrors the
+# existing 7-word choice-text cap, but for scene length instead.
+MIN_SCENE_WORDS = int(os.environ.get("MIN_SCENE_WORDS", "60"))
 
 # Bumping this invalidates every stored checkpoint (use when the checkpoint
 # shape changes, so a resume can't half-restore an incompatible payload).
@@ -201,6 +218,18 @@ class TruncatedOutputError(Exception):
     Retrying the identical prompt reproduces it exactly, so the caller shrinks
     the requested scene count instead of retrying blind."""
 
+
+class TruncatedOutputError(Exception):
+    """The model ran into its output-token ceiling part-way through the JSON.
+    Retrying the identical prompt reproduces it exactly, so the caller shrinks
+    the requested scene count instead of retrying blind."""
+
+
+class AssetLockError(Exception):
+    """Raised when a Tweak Scene edit would introduce a speaker/expression or
+    background the Asset Manifest doesn't already know about. Art is locked
+    after the AI Judge stage — a wording tweak must not be able to sneak in a
+    new portrait or backdrop the creator was never shown a slot for."""
 
 def _extract_retry_after(text: str):
     """Pulls a suggested wait out of whatever shape the vendor used.
@@ -348,6 +377,9 @@ class TweakSceneRequest(BaseModel):
     world_bible: str
     scene: dict
     instruction: str
+    asset_manifest: dict | None = None   # for the asset-lock check — optional
+                                          # so tweaking a pre-existing story
+                                          # (generated before this check) still works
 
 
 # ==========================================
@@ -436,6 +468,19 @@ the whole chapter has to be regenerated.
 - Give the player a meaningful choice every 2-4 scenes. Aim for 6-9 choice points across the chapter.
 - Choices MUST diverge into different next_scene paths (not two paths that reconverge in one scene).
 - For scenes with NO choices, use "next_scene_default": "next_scene_id".
+- Most choices should have 2 options, but at KEY moments (a turning point, a confession, the
+  chapter's climax) use 3 — the third must be a genuine middle path (delay, deflect, ask a
+  question instead of committing), not a reworded copy of the other two.
+- VARY WHAT THE CHOICE IS ABOUT. Do not make every choice "the honest thing vs. the evasive
+  thing." Across the chapter's choice points, mix in at least a few of these:
+  - Relationship-cost choices: helping/siding with one character visibly costs standing with another.
+  - Investigation choices: about WHAT to look at or WHO to ask, not whether to be honest.
+  - Cruel-honest choices: the truthful option is also the unkind one — honesty and kindness pull apart.
+  - Tone-only choices: change how a line lands (warm, sarcastic, blunt) with no score/relationship
+    effect at all — these exist purely for voice and characterization.
+  Not every scene needs a different type, but a chapter where all choices reduce to one repeated
+  axis (e.g. every choice is "tell the truth" vs "avoid it") is a failure — the player should not
+  be able to predict the "correct" choice after the second one.
 
 **CHOICE FORMATTING RULES:**
 1. Every scene with "choices" MUST include a "choice_prompt" field: 1-2 sentences of real in-world text
@@ -444,6 +489,7 @@ the whole chapter has to be regenerated.
 2. Each "text" in choices MUST be under 7 words — a punchy action or phrase, not a full sentence.
    Good: "Fight the guard", "Ask about the ring", "Stay silent"
    Bad: "You decide to attack the guard before he can call for backup"
+3. A scene's "choices" array MUST have exactly 2 or exactly 3 entries — never 1, never 4+.
 
 **SPEAKER NAME RULE (critical for asset matching):**
 - Every dialogue block's "speaker" field MUST match a canonical name from the Character Roster above,
@@ -491,6 +537,7 @@ the whole chapter has to be regenerated.
 
 Scenes with NO choices should omit "choice_prompt" and "choices" and just use "next_scene_default".
 """
+
 
 ASSET_MANIFEST_PROMPT = """
 You are the art director and copywriter for a Visual Novel. You are writing the
@@ -576,6 +623,39 @@ Output ONLY valid JSON in this exact structure:
 }}
 """
 
+ASSET_MANIFEST_BACKFILL_PROMPT = """
+You are finishing an asset manifest for a Visual Novel — a first pass already
+described most entries, but these specific ones came back blank and need a
+description each. This is a SHORT, focused list, so give each entry the full
+attention it deserves.
+
+**World Bible:**
+{world_bible}
+
+**Backgrounds still needing a description (2 sentences each: location, time
+of day, light source + direction, 2-3 establishing objects — an EMPTY stage,
+no people):**
+{missing_backgrounds}
+
+**Characters still needing a base_description (2-3 sentences: apparent age,
+build, hair, full outfit head to toe, one or two signature props, 2-3 colour
+palette — person and costume ONLY, no mood/setting/pose):**
+{missing_characters}
+
+Output ONLY valid JSON in this exact structure — include ONLY the ids/names
+listed above, nothing else:
+{{
+  "backgrounds": [
+    {{ "id": "clinic_night", "description": "..." }}
+  ],
+  "characters": [
+    {{ "name": "Amara", "base_description": "..." }}
+  ]
+}}
+"""
+
+
+
 JUDGE_PROMPT = """
 You are the Vystoria Quality Judge, an expert Visual Novel critic and structural editor.
 Evaluate the COMPLETE generated story below across five parameters. Be strict and specific —
@@ -599,7 +679,11 @@ sampled scenes and structure from the full listing.
 
 A. Choice Impact & Player Agency — Do branching choices lead to genuinely different scenes
    (not a reworded funnel back to the same text)? Does "choice_prompt" reflect real tension?
-   Are choice "text" values punchy and under ~7 words?
+   Are choice "text" values punchy and under ~7 words? Critically: do choices vary in TYPE
+   across the story (relationship-cost, investigation, cruel-honest, tone-only), or does
+   every choice reduce to the same "honest vs. evasive" axis? A story where the player can
+   guess the "correct" option after the second choice scores LOW here, even if every
+   individual choice_prompt is well-written.
 
 B. World-Bible & Lore Consistency — Does the story respect the rules, characters, and settings
    established in the World Bible? Flag any location/power/character inconsistency. Also flag
@@ -1380,6 +1464,73 @@ def build_asset_manifest(world_bible, speaker_expressions_map, background_ids,
             "art_direction": "",
         }
         return fallback, str(e)
+    
+
+def _find_missing_manifest_descriptions(asset_manifest):
+    """Returns (missing_backgrounds, missing_characters) — background ids and
+    character names whose description came back blank. Doesn't check
+    per-expression notes; those are short enough that emptiness there is rare
+    and low-stakes, since they only ever supplement the base_description."""
+    missing_bgs = [
+        b.get("id") for b in (asset_manifest.get("backgrounds") or [])
+        if b.get("id") and not (b.get("description") or "").strip()
+    ]
+    missing_chars = [
+        c.get("name") for c in (asset_manifest.get("characters") or [])
+        if c.get("name") and not (c.get("base_description") or "").strip()
+    ]
+    return missing_bgs, missing_chars
+
+
+def backfill_asset_manifest(world_bible, asset_manifest, provider, api_key, model_name,
+                             *, budget=None, on_log=None):
+    """Fills in any background/character description that came back blank from
+    build_asset_manifest(). A much shorter, targeted list per call means far
+    more output budget per entry, so this should succeed even when the full
+    first-pass call didn't have room to give every entry real attention.
+    Mutates and returns `asset_manifest`; never raises for an ordinary
+    failure — a failed backfill just leaves the blanks for the creator to
+    fill by hand from the Art tab."""
+    missing_bgs, missing_chars = _find_missing_manifest_descriptions(asset_manifest)
+    if not missing_bgs and not missing_chars:
+        return asset_manifest
+
+    if on_log:
+        on_log(f"⚠️ {len(missing_bgs)} background(s) and {len(missing_chars)} character(s) came back "
+               f"with no description — running a short follow-up call to fill them in.")
+
+    try:
+        raw = call_llm_guarded(
+            ASSET_MANIFEST_BACKFILL_PROMPT.format(
+                world_bible=world_bible,
+                missing_backgrounds="\n".join(f"- {b}" for b in missing_bgs) or "(none)",
+                missing_characters="\n".join(f"- {c}" for c in missing_chars) or "(none)",
+            ),
+            "Output ONLY valid JSON.", provider, api_key, model_name,
+            label="asset-manifest-backfill", budget=budget, on_log=on_log, json_mode=True,
+        )
+        filled = json.loads(clean_json_output(raw))
+
+        by_id = {b.get("id"): b for b in (asset_manifest.get("backgrounds") or [])}
+        for b in filled.get("backgrounds", []):
+            target = by_id.get(b.get("id"))
+            if target and b.get("description"):
+                target["description"] = b["description"]
+
+        by_name = {c.get("name"): c for c in (asset_manifest.get("characters") or [])}
+        for c in filled.get("characters", []):
+            target = by_name.get(c.get("name"))
+            if target and c.get("base_description"):
+                target["base_description"] = c["base_description"]
+
+    except (QuotaExhaustedError, ModelUnavailableError):
+        raise
+    except Exception as e:
+        if on_log:
+            on_log(f"⚠️ Backfill call failed ({e}) — {len(missing_bgs) + len(missing_chars)} entries "
+                   f"are still blank. Fill them in manually from the Art tab, or regenerate the manifest.")
+
+    return asset_manifest    
 
 
 def _reachable_scene_ids(final_story):
@@ -1401,6 +1552,50 @@ def _reachable_scene_ids(final_story):
     return seen
 
 
+_WORD_RE = re.compile(r"[a-z0-9']+")
+
+def _normalize_line(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — so two lines that
+    differ only by a comma or a capital letter still register as the same
+    line for duplicate detection."""
+    return " ".join(_WORD_RE.findall((text or "").lower()))
+
+
+def find_duplicate_lines(final_story, min_words=6):
+    """Book-wide pass: flags dialogue/narrative lines that appear verbatim
+    (after normalization) in more than one scene. Short lines ("I know.",
+    "No.") are expected to repeat and are excluded via min_words — this is
+    for catching a whole sentence accidentally reused across routes/endings,
+    like a scene-card ledger that stopped tracking after one act would miss.
+    Returns a list of {"text", "scene_ids"} for lines seen 2+ times."""
+    seen: dict[str, list[str]] = {}
+    for scene in final_story.get("scenes", []):
+        sid = scene.get("id")
+        for block in scene.get("sequence", []):
+            raw = (block.get("text") or "").strip()
+            if len(raw.split()) < min_words:
+                continue
+            norm = _normalize_line(raw)
+            seen.setdefault(norm, []).append(sid)
+
+    duplicates = []
+    for norm, scene_ids in seen.items():
+        unique_scenes = sorted(set(scene_ids))
+        if len(unique_scenes) > 1:
+            # Recover one original (un-normalized) instance for a readable report.
+            original = next(
+                (block.get("text") for scene in final_story.get("scenes", [])
+                 for block in scene.get("sequence", [])
+                 if _normalize_line(block.get("text") or "") == norm),
+                norm,
+            )
+            duplicates.append({"text": original, "scene_ids": unique_scenes})
+
+    duplicates.sort(key=lambda d: -len(d["scene_ids"]))
+    return duplicates
+
+
+
 def compute_story_stats(final_story):
     """Measures everything measurable in Python so the judge doesn't have to
     count — and can't get the counting wrong. Cheap, deterministic, free."""
@@ -1412,10 +1607,15 @@ def compute_story_stats(final_story):
     choice_scenes = total_choices = 0
     generic_prompts = []
     long_choices = []
+    thin_scenes = []
+    choices_out_of_range = []
+    total_words = 0
     speakers, expressions, endings = {}, {}, []
 
     for scene in scenes:
+        scene_words = 0
         for block in scene.get("sequence", []):
+            scene_words += len((block.get("text") or "").split())
             if block.get("type") == "dialogue":
                 dialogue += 1
                 spk = block.get("speaker") or "(unnamed)"
@@ -1425,9 +1625,15 @@ def compute_story_stats(final_story):
             else:
                 narrative += 1
 
+        total_words += scene_words
+        if scene_words < MIN_SCENE_WORDS:
+            thin_scenes.append(f'{scene.get("id")} ({scene_words}w)')
+
         if scene.get("choices"):
             choice_scenes += 1
             total_choices += len(scene["choices"])
+            if len(scene["choices"]) not in (2, 3):
+                choices_out_of_range.append(f'{scene.get("id")} ({len(scene["choices"])})')
             prompt = (scene.get("choice_prompt") or "").strip()
             if len(prompt) < 20:
                 generic_prompts.append(scene.get("id"))
@@ -1438,6 +1644,7 @@ def compute_story_stats(final_story):
             endings.append(scene.get("id"))
 
     total_blocks = (dialogue + narrative) or 1
+    duplicate_lines = find_duplicate_lines(final_story)
     stats = {
         "scene_count": len(scenes),
         "dialogue_blocks": dialogue,
@@ -1454,6 +1661,16 @@ def compute_story_stats(final_story):
         "expression_usage": dict(sorted(expressions.items(), key=lambda kv: -kv[1])),
         "scenes_with_thin_choice_prompt": generic_prompts[:10],
         "choices_over_7_words": long_choices[:10],
+        "choices_out_of_range": choices_out_of_range[:10],
+        "total_words": total_words,
+        "avg_words_per_scene": round(total_words / len(scenes), 1) if scenes else 0,
+        "min_scene_words_threshold": MIN_SCENE_WORDS,
+        "scenes_under_min_words": thin_scenes[:15],
+        "scenes_under_min_words_count": len(thin_scenes),
+        "duplicate_lines": [
+            {"text": d["text"], "scenes": d["scene_ids"]} for d in duplicate_lines[:10]
+        ],
+        "duplicate_line_count": len(duplicate_lines),
     }
     return stats
 
@@ -1514,10 +1731,11 @@ def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name
     must not sink a story that generated fine. Quota walls DO propagate, so
     the pipeline can checkpoint rather than mislabel the run."""
     try:
+        story_stats = compute_story_stats(final_story)
         raw = call_llm_guarded(
             JUDGE_PROMPT.format(
                 world_bible=world_bible,
-                story_stats=json.dumps(compute_story_stats(final_story), ensure_ascii=False, indent=2),
+                story_stats=json.dumps(story_stats, ensure_ascii=False, indent=2),
                 story_digest=build_judge_digest(final_story),
             ),
             "You are a rigorous, detail-oriented Visual Novel quality judge. Output ONLY valid JSON.",
@@ -1541,6 +1759,17 @@ def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name
             if score < rule["min_pass"]:
                 failed_params.append(key)
 
+        # Structural, code-measured gates — not left to the LLM's judgment.
+        # A scene under MIN_SCENE_WORDS fails the run outright: strict mode
+        # re-rolls it, advisory mode still shows it as a real FAIL reason
+        # instead of a stat buried in structural_stats nobody opens.
+        if story_stats.get("scenes_under_min_words_count"):
+            failed_params.append("scene_length")
+        # A whole sentence reused verbatim across two+ scenes (often two
+        # different endings/routes) — the ledger-stopped-after-Act-III bug.
+        if story_stats.get("duplicate_line_count"):
+            failed_params.append("duplicate_lines")
+
         overall_score = round(weighted_sum / total_weight, 2) if total_weight else None
         status = "FAIL" if (overall_score is None or overall_score < JUDGE_PASS_SCORE or failed_params) else "PASS"
 
@@ -1551,7 +1780,8 @@ def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name
             "summary": evaluation.get("summary", ""),
             "metrics": metrics,
             "actionable_critiques": evaluation.get("actionable_critiques", []),
-            "structural_stats": compute_story_stats(final_story),
+            "structural_stats": story_stats,
+            "model_used": model_name,
             "evaluated_at": datetime.now(timezone.utc).isoformat(),
         }, None
 
@@ -1569,7 +1799,90 @@ def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name
             "evaluated_at": datetime.now(timezone.utc).isoformat(),
         }, str(e)
 
-def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name):
+def _check_asset_lock(revised_scene, asset_manifest):
+    """Raises AssetLockError if `revised_scene` uses any speaker/expression or
+    background id that isn't already cataloged in `asset_manifest`. No-op if
+    no manifest was supplied (e.g. tweaking a story generated before this
+    check existed)."""
+    if not asset_manifest:
+        return
+
+    known_exprs = {
+        c.get("name"): {e.get("id") for e in (c.get("expressions") or [])}
+        for c in (asset_manifest.get("characters") or [])
+    }
+    known_bgs = {b.get("id") for b in (asset_manifest.get("backgrounds") or [])}
+
+    bg = revised_scene.get("background")
+    if bg and bg not in known_bgs:
+        raise AssetLockError(
+            f"This edit uses background '{bg}', which isn't in the Asset Manifest. "
+            f"Art is locked after the AI Judge — regenerate the manifest if you need "
+            f"a new background instead of introducing one through Tweak Scene."
+        )
+
+    for block in revised_scene.get("sequence", []) or []:
+        if block.get("type") != "dialogue":
+            continue
+        speaker = block.get("speaker")
+        expr = block.get("expression") or "neutral"
+        if speaker not in known_exprs:
+            raise AssetLockError(
+                f"This edit gives dialogue to '{speaker}', who isn't in the Asset "
+                f"Manifest. Tweak Scene can't introduce a new character portrait — "
+                f"regenerate the manifest instead."
+            )
+        if expr not in known_exprs[speaker]:
+            raise AssetLockError(
+                f"This edit gives {speaker} the '{expr}' expression, which isn't "
+                f"cataloged for them. Art is locked after the AI Judge — pick an "
+                f"expression already listed in the manifest, or regenerate it."
+            )
+
+
+def _judge_model_candidates(provider, requested_model):
+    """Ordered, de-duplicated model list to try for the Judge call:
+    1. whatever the creator configured for this run
+    2. this provider's known-stable default
+    3. a second, even-safer fallback for this provider
+    All stay on the SAME provider/key — a creator supplies one key per run,
+    so there's no vendor to fall back to, only model names."""
+    provider = (provider or "").lower()
+    candidates = [requested_model, DEFAULT_MODELS.get(provider), *JUDGE_MODEL_FALLBACKS.get(provider, [])]
+    seen = []
+    for m in candidates:
+        if m and m not in seen:
+            seen.append(m)
+    return seen
+
+
+def run_judge_evaluation_with_fallback(world_bible, final_story, provider, api_key, requested_model,
+                                        *, budget=None, on_log=None):
+    """Wraps run_judge_evaluation with the explicit fallback order above.
+    Ordinary judge failures (bad JSON, a low score) never reach here — those
+    are handled inside run_judge_evaluation and returned as a normal ERROR/FAIL
+    scorecard. Only ModelUnavailableError/QuotaExhaustedError trigger a retry
+    on the next candidate, so one dead model name no longer takes an otherwise
+    finished generation run down with it."""
+    candidates = _judge_model_candidates(provider, requested_model)
+    last_exc = None
+    for i, candidate in enumerate(candidates):
+        try:
+            if i > 0 and on_log:
+                on_log(f"⚠️ Judge model '{candidates[i-1]}' unavailable — retrying with '{candidate}'.")
+            return run_judge_evaluation(
+                world_bible, final_story, provider, api_key, candidate,
+                budget=budget, on_log=on_log,
+            )
+        except (ModelUnavailableError, QuotaExhaustedError) as e:
+            last_exc = e
+            continue
+    # Every candidate on this provider/key failed — a real wall, not one bad
+    # model name. Propagate so the pipeline checkpoints and the creator sees
+    # an accurate "paused" state instead of a fake pass.
+    raise last_exc
+
+def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name, asset_manifest=None):
     """Rewrites ONE scene per a targeted creator instruction."""
     original_id = scene.get("id")
     raw = call_llm_guarded(
@@ -1610,8 +1923,12 @@ def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name):
 
     normalize_speakers([revised], set())
 
-    return revised
+    # Art is locked after the AI Judge (see build_asset_manifest) — a wording
+    # tweak must not be able to sneak in a speaker, expression, or background
+    # the manifest, and therefore the creator's Art tab, doesn't know about.
+    _check_asset_lock(revised, asset_manifest)
 
+    return revised
 # ==========================================
 # 5. ASYNC BACKGROUND WORKER THREAD
 # ==========================================
@@ -1862,7 +2179,7 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
 
             update_task('generating', f'Running AI Judge (pass {judge_attempt}/{max_judge_attempts})...', 85,
                         "Submitting a structural digest of the draft to the AI Judge...")
-            evaluation_scorecard, judge_err = run_judge_evaluation(
+            evaluation_scorecard, judge_err = run_judge_evaluation_with_fallback(
                 world_bible, final_story, req.provider, req.api_key, req.model_name,
                 budget=budget, on_log=lambda m: update_task('generating', 'Running AI Judge...', 85, m),
             )
@@ -1930,6 +2247,19 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
         else:
             asset_manifest, asset_err = build_asset_manifest(
                 world_bible, speaker_expressions_map, background_ids,
+                req.provider, req.api_key, req.model_name,
+                budget=budget,
+                on_log=lambda m: update_task('generating', 'Cataloging assets...', 90, m),
+            )
+            checkpoint["asset_manifest"] = asset_manifest
+            _save_checkpoint(task_id, checkpoint)
+
+        if not asset_err:
+            # A successful call can still leave some entries blank — a long
+            # list under output-token pressure gets quietly thinned rather
+            # than cleanly truncated. One short, targeted follow-up catches it.
+            asset_manifest = backfill_asset_manifest(
+                world_bible, asset_manifest,
                 req.provider, req.api_key, req.model_name,
                 budget=budget,
                 on_log=lambda m: update_task('generating', 'Cataloging assets...', 90, m),
@@ -2120,7 +2450,7 @@ def evaluate_story_endpoint(task_id: str, req: EvaluateRequest):
         world_bible = row.get("world_bible") or ""
         final_story = row["result_json"]
 
-        evaluation_scorecard, judge_err = run_judge_evaluation(
+        evaluation_scorecard, judge_err = run_judge_evaluation_with_fallback(
             world_bible, final_story, req.provider, req.api_key, req.model_name,
             budget=CallBudget(5),   # a manual re-run should never spiral
         )
@@ -2147,9 +2477,12 @@ def tweak_scene_endpoint(req: TweakSceneRequest):
     try:
         revised_scene = tweak_scene(
             req.world_bible, req.scene, req.instruction.strip(),
-            req.provider, req.api_key, req.model_name
+            req.provider, req.api_key, req.model_name,
+            asset_manifest=req.asset_manifest,
         )
         return {"status": "success", "scene": revised_scene}
+    except AssetLockError as ale:
+        raise HTTPException(status_code=400, detail=str(ale))
     except ModelUnavailableError as mue:
         raise HTTPException(status_code=400, detail=str(mue))
     except Exception as e:
@@ -2204,10 +2537,12 @@ ASPECT_HINTS = {
     # Portraits are composited over a background at runtime, so anything behind
     # the figure is something the creator has to cut out by hand later.
     "character": (
-        "Full-body character reference of ONE single figure, standing, facing the viewer, "
-        "in a neutral relaxed pose. Vertical 3:4 framing, figure centred, with the whole "
-        "body from the top of the head to the soles of the feet inside the frame and clear "
-        "margin above and below — do not crop the head or the feet. "
+        "Upper-body portrait of ONE single figure, cropped at roughly the waist — from the "
+        "top of the head down to the belt line only. Do NOT show the legs, hips, or feet; "
+        "this is a 'bust' character sprite, not a full-body reference. Vertical 3:4 framing, "
+        "facing the viewer, neutral relaxed pose, figure centred and scaled so the upper "
+        "body fills most of the frame vertically — zoom in rather than leave empty space "
+        "below the crop. "
         "COMPLETELY TRANSPARENT BACKGROUND. Nothing at all behind the figure: no scenery, "
         "no room, no floor, no ground, no cast shadow, no drop shadow, no colour fill, "
         "no gradient, no backdrop, no props. Clean sharp silhouette edges, ready to cut out "
