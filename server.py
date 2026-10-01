@@ -3509,7 +3509,10 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
 # ==========================================
 # 6. API ENDPOINTS
 # ==========================================
-@app.get("/")
+# GET *and* HEAD: Render's port/health probe sends HEAD, and a GET-only route
+# answers it with 405, which makes Render keep retrying and leaves the deploy
+# sitting on "Building" for minutes after the app is already serving.
+@app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "Vystoria Multi-Model Server is running!"}
 
