@@ -10,6 +10,7 @@ import secrets
 import threading
 import httpx
 import traceback
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -219,12 +220,6 @@ class TruncatedOutputError(Exception):
     the requested scene count instead of retrying blind."""
 
 
-class TruncatedOutputError(Exception):
-    """The model ran into its output-token ceiling part-way through the JSON.
-    Retrying the identical prompt reproduces it exactly, so the caller shrinks
-    the requested scene count instead of retrying blind."""
-
-
 class AssetLockError(Exception):
     """Raised when a Tweak Scene edit would introduce a speaker/expression or
     background the Asset Manifest doesn't already know about. Art is locked
@@ -380,6 +375,8 @@ class TweakSceneRequest(BaseModel):
     asset_manifest: dict | None = None   # for the asset-lock check — optional
                                           # so tweaking a pre-existing story
                                           # (generated before this check) still works
+    story_state: dict | None = None      # the story's declared variables (Phase 3);
+                                          # None for legacy stories
 
 
 # ==========================================
@@ -435,10 +432,90 @@ Using the World Bible provided below, create a high-level outline for the entire
 - {target_length} total
 - Each chapter should have: Chapter Number + Title, 1-2 paragraph summary, Key plot points, Major choices, Emotional tone.
 - Plan for 3-5 different endings.
+- Plan 2-3 REAL branch points inside the shared chapters: choices that send the player to
+  genuinely different scenes (e.g. "follow Ines" vs "go to office hours"), not the same scene
+  reached with different wording.
+- Put world events on one shared timeline so parallel routes can't contradict each other: an
+  event that happens on day 5 happens on day 5 on every route.
 {idea_reminder}
 {reference_reminder}
 
+**STORY STATE (required).** After the outline, end your output with the story's state
+declaration, wrapped EXACTLY ONCE in <story_state> and </story_state> tags, containing ONLY
+valid JSON (no markdown fence inside the tags, no comments, no trailing commas).
+{state_spec}
+Example of the exact shape (replace every value with this story's own):
+<story_state>
+{state_example}
+</story_state>
+
 **World Bible:**\n{world_bible}
+"""
+
+# The strict declaration format every story's state follows. Shared by the
+# Outline prompt and the stand-alone fallback prompt below, and inserted with
+# .format(), so the braces in it are single.
+STATE_DECLARATION_SPEC = """
+Rules for the declaration:
+- "variables": 3 to 12 entries. Every "id" is lowercase snake_case and unique. "kind" is one of:
+  - "stat": a numeric score the whole story tracks (e.g. clarity). Integer "min", "max", "initial".
+  - "relationship": one per MAJOR named character whose opinion of the protagonist matters.
+    "character" MUST be that character's exact canonical roster name. Integer range, usually -5..5.
+  - "flag": a one-off plot fact, true/false (met_dora, read_the_file, knows_the_secret).
+  - "milestone": a world event that happens regardless of route (bel_moved, hearing_held). If the
+    story has a clock, give "due_day": the last day by which it MUST have happened on EVERY route.
+  - "clock": AT MOST ONE, and only if the story needs chronological progression. It is the shared
+    day counter: integer, "initial" usually 1, and it only ever moves forward.
+  Never force a plot fact into a number, or a score into a flag.
+- "endings": one per planned ending, in PRIORITY order — the engine gives the player the FIRST
+  ending whose condition is true. The LAST ending MUST have "condition": null: it is the fallback,
+  so every playthrough ends somewhere. Good endings should need a COMBINATION (for example a stat
+  plus a relationship plus a flag), not a single number.
+- A condition is either {"var": "<id>", "op": "<op>", "value": <value>} or {"all": [ ... ]} or
+  {"any": [ ... ]} of conditions. Numeric variables: ==, !=, >=, <=, >, < against an integer.
+  Flags and milestones: == or != against true/false. Only declared ids may appear.
+- "chapter_plan": one entry per chapter: "day_start"/"day_end" (only if there is a clock),
+  "sets_milestones" (milestone ids that must become true DURING that chapter) and "branch_points"
+  (short descriptions of choices in that chapter that lead to genuinely DIFFERENT scenes).
+"""
+
+STATE_DECLARATION_EXAMPLE = """{
+  "variables": [
+    {"id": "clarity", "kind": "stat", "label": "Clarity", "description": "How clearly the protagonist sees the truth", "min": 0, "max": 10, "initial": 2},
+    {"id": "trust_bayo", "kind": "relationship", "character": "Bayo", "label": "Bayo's trust", "description": "Whether Bayo believes the protagonist is on his side", "min": -5, "max": 5, "initial": 0},
+    {"id": "read_the_file", "kind": "flag", "label": "Read the file", "description": "The protagonist has read the sealed file", "initial": false},
+    {"id": "hearing_held", "kind": "milestone", "label": "The hearing", "description": "The parole hearing has taken place", "initial": false, "due_day": 5},
+    {"id": "day", "kind": "clock", "label": "Day", "description": "Days since the story began", "min": 1, "max": 14, "initial": 1}
+  ],
+  "endings": [
+    {"id": "true_end", "title": "The Whole Truth", "condition": {"all": [{"var": "clarity", "op": ">=", "value": 7}, {"var": "trust_bayo", "op": ">=", "value": 2}, {"var": "read_the_file", "op": "==", "value": true}]}},
+    {"id": "loyal_end", "title": "Side by Side", "condition": {"var": "trust_bayo", "op": ">=", "value": 4}},
+    {"id": "bad_end", "title": "Paper Walls", "condition": null}
+  ],
+  "chapter_plan": [
+    {"chapter": 1, "day_start": 1, "day_end": 2, "sets_milestones": [], "branch_points": ["Follow Ines or go to office hours: different scenes"]},
+    {"chapter": 2, "day_start": 3, "day_end": 5, "sets_milestones": ["hearing_held"], "branch_points": []}
+  ]
+}"""
+
+# Fallback only: used when the Outline's <story_state> block is missing or
+# unusable, so one sloppy outline doesn't cost the whole state system.
+STATE_DECLARATION_PROMPT = """
+You are designing the state system for a branching Visual Novel. Its World Bible and Outline
+are below. Declare the variables the engine will track, the endings with the exact conditions
+that earn them, and a per-chapter plan.
+{state_spec}
+**Character Roster (relationship variables must use these exact names):**
+{roster}
+
+**Outline:**
+{outline}
+
+**World Bible:**
+{world_bible}
+
+Output ONLY valid JSON in exactly this shape (replace every value with this story's own):
+{state_example}
 """
 
 CHAPTER_PROMPT = """
@@ -450,7 +527,7 @@ You are writing Chapter {chapter_number} of the Visual Novel.
 **Overall Outline:**\n{outline}
 **Previous Chapters Summary:**\n{previous_summary}
 **Character Roster (use these EXACT speaker names — see World Bible):**\n{roster}
-
+{state_section}
 Write Chapter {chapter_number}. Generate EXACTLY {scene_count} scenes — no more.
 Do not pad past {scene_count}; running long overflows the output-token limit and
 the whole chapter has to be regenerated.
@@ -684,10 +761,18 @@ A. Choice Impact & Player Agency — Do branching choices lead to genuinely diff
    every choice reduce to the same "honest vs. evasive" axis? A story where the player can
    guess the "correct" option after the second choice scores LOW here, even if every
    individual choice_prompt is well-written.
+   If the story declares STATE (a "STORY STATE" section in the digest, "story_state" in the
+   facts): do the choice effects make choices matter? Relationship choices should cost one
+   character while helping another, investigation choices should set flags that pay off later,
+   tone-only choices should carry no effects, and good endings should need a COMBINATION of
+   variables. Effects that all push the same number the same way are the old monotone problem
+   in a new form.
 
 B. World-Bible & Lore Consistency — Does the story respect the rules, characters, and settings
    established in the World Bible? Flag any location/power/character inconsistency. Also flag
-   any dialogue "speaker" value that doesn't match a canonical roster name.
+   any dialogue "speaker" value that doesn't match a canonical roster name. If the facts list
+   "milestone_violations", a route lets the day counter pass a world event's due day before
+   the event happens — cite those as continuity defects.
 
 C. Stylistic & Tonal Cohesion — Does the prose match the requested genre/tone and the World
    Bible's writing style guidelines? Flag generic tropes or tone-breaking modern slang.
@@ -746,6 +831,7 @@ You are NOT rewriting the story — only this one scene. Do not reference or inv
      surprised, worried, determined, smug, scared, thoughtful)
    - dialogue "speaker" values stay as the exact canonical names used in the original scene —
      don't add titles/surnames or rename anyone.
+5. {state_rules}
 
 **World Bible (tone/consistency reference only):**
 {world_bible}
@@ -786,6 +872,904 @@ VALID_EXPRESSIONS = {
     "neutral", "happy", "sad", "angry", "surprised",
     "worried", "determined", "smug", "scared", "thoughtful",
 }
+
+
+# ==========================================
+# 4b. STORY STATE (Phase 3) — variables, effects, conditions, ending gates
+# ==========================================
+# One strict declaration per story, emitted by the Outline stage:
+#   variables  — stat | relationship (numeric), flag | milestone (boolean),
+#                clock (the single shared day counter, numeric, only moves forward)
+#   endings    — ordered; first whose condition passes wins; last is the fallback
+#   chapter_plan — per-chapter days, milestones to set, and real branch points
+#
+# Effects:     {"var_id": delta_int | true/false}   on scenes (applied on arrival)
+#                                                    and on choices (applied on pick)
+# Conditions:  {"var","op","value"} | {"all":[...]} | {"any":[...]}
+#
+# The player app and the creator's test engine re-implement the evaluator in
+# JavaScript. Every rule here has a twin there — change them together.
+
+STATE_VERSION = 1
+STATE_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
+NUMERIC_KINDS = {"stat", "relationship", "clock"}
+BOOLEAN_KINDS = {"flag", "milestone"}
+STATE_KINDS = NUMERIC_KINDS | BOOLEAN_KINDS
+NUMERIC_DEFAULT_RANGE = {"stat": (0, 10), "relationship": (-5, 5), "clock": (1, 365)}
+CONDITION_OPS = {"==", "!=", ">=", "<=", ">", "<"}
+MAX_STATE_VARIABLES = 24
+MAX_STATE_ENDINGS = 8
+MAX_CONDITION_DEPTH = 4
+STATE_SIM_MAX_STATES = int(os.environ.get("STATE_SIM_MAX_STATES", "150000"))
+STATE_SIM_WALKS = 2000
+STATE_SIM_MAX_STEPS = 3000
+
+_CONDITION_TERM_RE = re.compile(
+    r"^\s*([a-z][a-z0-9_]*)\s*(==|!=|>=|<=|>|<)\s*(true|false|-?\d+)\s*$", re.IGNORECASE
+)
+
+
+def _as_int(value):
+    """Strict int coercion. bool is rejected on purpose — in Python True is
+    an int, and letting it through would make `trust_bayo + True` legal."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and re.fullmatch(r"\s*-?\d+\s*", value):
+        return int(value)
+    return None
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return None
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _state_var_index(story_state):
+    return {v["id"]: v for v in (story_state or {}).get("variables", [])}
+
+
+def _parse_condition_string(text):
+    """Accepts the human form 'clarity >= 7 AND read_the_file == true' as a
+    fallback when a model writes a string instead of the structured object.
+    Mixed AND/OR is rejected — there are no parentheses to disambiguate it."""
+    has_and = re.search(r"\s+AND\s+", text, re.IGNORECASE)
+    has_or = re.search(r"\s+OR\s+", text, re.IGNORECASE)
+    if has_and and has_or:
+        return None
+    joiner = "any" if has_or else "all"
+    parts = re.split(r"\s+(?:AND|OR)\s+", text, flags=re.IGNORECASE)
+    leaves = []
+    for part in parts:
+        m = _CONDITION_TERM_RE.match(part)
+        if not m:
+            return None
+        raw_value = m.group(3).lower()
+        value = (raw_value == "true") if raw_value in ("true", "false") else int(raw_value)
+        leaves.append({"var": m.group(1).lower(), "op": m.group(2), "value": value})
+    return leaves[0] if len(leaves) == 1 else {joiner: leaves}
+
+
+def normalize_condition(cond, var_index, depth=0):
+    """Returns (normalized_condition | None, error_message | None).
+    None with no error means "no condition" (always true)."""
+    if cond is None or cond == {} or cond == "":
+        return None, None
+    if depth > MAX_CONDITION_DEPTH:
+        return None, "condition nested too deeply"
+    if isinstance(cond, str):
+        parsed = _parse_condition_string(cond)
+        if parsed is None:
+            return None, f"could not parse condition string '{cond[:80]}'"
+        cond = parsed
+    if not isinstance(cond, dict):
+        return None, "condition is not an object"
+
+    for group in ("all", "any"):
+        if group in cond:
+            items = cond.get(group)
+            if not isinstance(items, list) or not items:
+                return None, f"'{group}' must be a non-empty list"
+            out = []
+            for item in items:
+                norm, err = normalize_condition(item, var_index, depth + 1)
+                if err:
+                    return None, err
+                if norm is not None:
+                    out.append(norm)
+            if not out:
+                return None, f"'{group}' had no valid terms"
+            return (out[0] if len(out) == 1 else {group: out}), None
+
+    var_id, op = cond.get("var"), cond.get("op")
+    if not isinstance(var_id, str) or var_id not in var_index:
+        return None, f"condition uses undeclared variable '{var_id}'"
+    if op not in CONDITION_OPS:
+        return None, f"condition on '{var_id}' uses unsupported operator '{op}'"
+    kind = var_index[var_id]["kind"]
+    if kind in BOOLEAN_KINDS:
+        value = _as_bool(cond.get("value"))
+        if value is None or op not in ("==", "!="):
+            return None, f"'{var_id}' is a {kind} — only == / != true|false are allowed"
+    else:
+        value = _as_int(cond.get("value"))
+        if value is None:
+            return None, f"'{var_id}' is numeric — condition value must be an integer"
+    return {"var": var_id, "op": op, "value": value}, None
+
+
+def _same_typed_equal(a, b):
+    return isinstance(a, bool) == isinstance(b, bool) and a == b
+
+
+def evaluate_condition(state, cond, depth=0):
+    """Twin of evalCondition() in both React apps. None = always true;
+    anything malformed = false; unknown variable = false."""
+    if cond is None:
+        return True
+    if not isinstance(cond, dict) or depth > 6:
+        return False
+    if isinstance(cond.get("all"), list):
+        return all(evaluate_condition(state, c, depth + 1) for c in cond["all"])
+    if isinstance(cond.get("any"), list):
+        return any(evaluate_condition(state, c, depth + 1) for c in cond["any"])
+    var_id, op = cond.get("var"), cond.get("op")
+    if not isinstance(var_id, str) or not isinstance(op, str) or var_id not in state:
+        return False
+    a, b = state[var_id], cond.get("value")
+    if op == "==":
+        return _same_typed_equal(a, b)
+    if op == "!=":
+        return not _same_typed_equal(a, b)
+    # Integer-valued floats count as integers, exactly like Number.isInteger
+    # in the JS twin (JSON has no separate int type).
+    a, b = _as_int(a) if not isinstance(a, str) else None, _as_int(b) if not isinstance(b, str) else None
+    if a is None or b is None:
+        return False
+    return {">=": a >= b, "<=": a <= b, ">": a > b, "<": a < b}.get(op, False)
+
+
+def format_condition(cond):
+    """Human-readable form used in prompts, the Judge digest and logs."""
+    if cond is None:
+        return "always"
+    if not isinstance(cond, dict):
+        return "(invalid)"
+
+    def wrap(c):
+        grouped = isinstance(c, dict) and ("all" in c or "any" in c)
+        return f"({format_condition(c)})" if grouped else format_condition(c)
+
+    if isinstance(cond.get("all"), list):
+        return " AND ".join(wrap(c) for c in cond["all"])
+    if isinstance(cond.get("any"), list):
+        return " OR ".join(wrap(c) for c in cond["any"])
+    value = cond.get("value")
+    shown = ("true" if value else "false") if isinstance(value, bool) else value
+    return f"{cond.get('var')} {cond.get('op')} {shown}"
+
+
+def normalize_story_state(raw, canonical_names=None):
+    """Validates and normalizes the Outline's declaration into the strict,
+    standard shape. Returns (story_state | None, warnings). None means the
+    story runs in legacy (stateless) mode — never an exception."""
+    warnings = []
+    if not isinstance(raw, dict):
+        return None, ["state declaration is not a JSON object"]
+
+    canon_lower = {c.lower(): c for c in (canonical_names or set())}
+    variables, seen, clock_seen = [], set(), False
+    for v in raw.get("variables") or []:
+        if not isinstance(v, dict):
+            continue
+        vid = str(v.get("id") or "").strip().lower()
+        kind = str(v.get("kind") or "").strip().lower()
+        if not STATE_ID_RE.match(vid):
+            warnings.append(f"variable id '{v.get('id')}' is not snake_case — dropped")
+            continue
+        if vid in seen:
+            warnings.append(f"variable '{vid}' declared twice — kept the first")
+            continue
+        if kind not in STATE_KINDS:
+            warnings.append(f"variable '{vid}' has unknown kind '{kind}' — dropped")
+            continue
+        if kind == "clock" and clock_seen:
+            warnings.append(f"second clock '{vid}' dropped — a story has one shared day counter")
+            continue
+        if len(variables) >= MAX_STATE_VARIABLES:
+            warnings.append(f"more than {MAX_STATE_VARIABLES} variables — '{vid}' and later dropped")
+            break
+
+        entry = {
+            "id": vid,
+            "kind": kind,
+            "label": (str(v.get("label") or "").strip() or vid.replace("_", " ").title())[:60],
+            "description": str(v.get("description") or "").strip()[:200],
+        }
+        if kind in NUMERIC_KINDS:
+            lo_d, hi_d = NUMERIC_DEFAULT_RANGE[kind]
+            lo, hi = _as_int(v.get("min")), _as_int(v.get("max"))
+            lo = lo_d if lo is None else lo
+            hi = hi_d if hi is None else hi
+            if lo >= hi:
+                warnings.append(f"'{vid}' had min >= max — reset to {lo_d}..{hi_d}")
+                lo, hi = lo_d, hi_d
+            if kind == "clock" and lo < 1:
+                lo = 1
+                hi = max(hi, 2)
+            default_initial = 1 if kind == "clock" else (0 if kind == "relationship" else lo)
+            initial = _as_int(v.get("initial"))
+            entry.update({"min": lo, "max": hi,
+                          "initial": _clamp(default_initial if initial is None else initial, lo, hi)})
+            if kind == "relationship":
+                who = str(v.get("character") or "").strip()
+                if who and canon_lower and who not in canonical_names:
+                    who = canon_lower.get(who.lower(), who)
+                if not who:
+                    warnings.append(f"relationship '{vid}' names no character")
+                elif canon_lower and who not in canonical_names:
+                    warnings.append(f"relationship '{vid}' names '{who}', who is not in the roster")
+                entry["character"] = who
+            if kind == "clock":
+                clock_seen = True
+        else:
+            initial = _as_bool(v.get("initial"))
+            entry["initial"] = bool(initial) if initial is not None else False
+            if kind == "milestone":
+                due = _as_int(v.get("due_day"))
+                if due is not None and due >= 1:
+                    entry["due_day"] = due
+        variables.append(entry)
+        seen.add(vid)
+
+    if not variables:
+        return None, warnings + ["no valid variables declared — story will run without state"]
+
+    if not clock_seen:
+        for entry in variables:
+            if entry.get("due_day") is not None:
+                warnings.append(f"milestone '{entry['id']}' has a due_day but the story has no clock — ignored")
+                entry.pop("due_day", None)
+
+    var_index = {v["id"]: v for v in variables}
+
+    endings, ending_ids = [], set()
+    for e in raw.get("endings") or []:
+        if not isinstance(e, dict):
+            continue
+        eid = str(e.get("id") or "").strip().lower()
+        if not STATE_ID_RE.match(eid) or eid in ending_ids:
+            warnings.append(f"ending id '{e.get('id')}' invalid or duplicated — dropped")
+            continue
+        cond, err = normalize_condition(e.get("condition"), var_index)
+        if err:
+            warnings.append(f"ending '{eid}': {err} — treated as unconditional")
+            cond = None
+        endings.append({"id": eid, "title": (str(e.get("title") or "").strip() or eid.replace("_", " ").title())[:80],
+                        "condition": cond})
+        ending_ids.add(eid)
+        if len(endings) >= MAX_STATE_ENDINGS:
+            break
+
+    if endings:
+        gated = [e for e in endings if e["condition"] is not None]
+        fallbacks = [e for e in endings if e["condition"] is None]
+        if not fallbacks:
+            fallback = gated.pop()
+            fallback["condition"] = None
+            warnings.append(f"no fallback ending declared — '{fallback['id']}' is now the fallback")
+            fallbacks = [fallback]
+        elif len(fallbacks) > 1:
+            for dropped in fallbacks[:-1]:
+                warnings.append(f"ending '{dropped['id']}' had no condition and would shadow later "
+                                f"endings — dropped; '{fallbacks[-1]['id']}' is the fallback")
+            fallbacks = fallbacks[-1:]
+        endings = gated + fallbacks
+
+    milestone_ids = {v["id"] for v in variables if v["kind"] == "milestone"}
+    chapter_plan = []
+    for p in raw.get("chapter_plan") or []:
+        if not isinstance(p, dict):
+            continue
+        ch = _as_int(p.get("chapter"))
+        if ch is None or ch < 1:
+            continue
+        entry = {"chapter": ch}
+        ds, de = _as_int(p.get("day_start")), _as_int(p.get("day_end"))
+        if clock_seen and ds is not None and ds >= 1:
+            entry["day_start"] = ds
+            entry["day_end"] = max(ds, de) if de is not None else ds
+        entry["sets_milestones"] = [m for m in (p.get("sets_milestones") or []) if m in milestone_ids]
+        entry["branch_points"] = [str(b).strip()[:240] for b in (p.get("branch_points") or []) if str(b).strip()][:4]
+        chapter_plan.append(entry)
+    chapter_plan.sort(key=lambda p: p["chapter"])
+
+    return {"state_version": STATE_VERSION, "variables": variables,
+            "endings": endings, "chapter_plan": chapter_plan}, warnings
+
+
+def sanitize_effects(effects, var_index):
+    """Returns (clean_effects | None, warnings). Numeric kinds take an integer
+    delta (clock may only move forward); boolean kinds take true/false."""
+    if not effects:
+        return None, []
+    if not isinstance(effects, dict):
+        return None, ["effects is not an object — dropped"]
+    clean, warnings = {}, []
+    for var_id, value in effects.items():
+        var = var_index.get(var_id)
+        if not var:
+            warnings.append(f"effect on undeclared variable '{var_id}' dropped")
+            continue
+        if var["kind"] in BOOLEAN_KINDS:
+            b = _as_bool(value)
+            if b is None:
+                warnings.append(f"'{var_id}' is a {var['kind']} — effect must be true/false, got {value!r}")
+                continue
+            clean[var_id] = b
+        else:
+            d = _as_int(value)
+            if d is None or d == 0:
+                if d is None:
+                    warnings.append(f"'{var_id}' is numeric — effect must be an integer delta, got {value!r}")
+                continue
+            if var["kind"] == "clock" and d < 0:
+                warnings.append(f"clock '{var_id}' cannot move backwards — effect {d} dropped")
+                continue
+            span = var["max"] - var["min"]
+            clean[var_id] = _clamp(d, -span, span)
+    return (clean or None), warnings
+
+
+def apply_effects(state, effects, var_index):
+    """Twin of applyEffects() in both React apps."""
+    if not effects:
+        return state
+    out = dict(state)
+    for var_id, value in effects.items():
+        var = var_index.get(var_id)
+        if not var or var_id not in out:
+            continue
+        if var["kind"] in BOOLEAN_KINDS:
+            if isinstance(value, bool):
+                out[var_id] = value
+        elif isinstance(value, int) and not isinstance(value, bool):
+            out[var_id] = _clamp(out[var_id] + value, var["min"], var["max"])
+    return out
+
+
+def initial_story_state(story_state):
+    return {v["id"]: v["initial"] for v in (story_state or {}).get("variables", [])}
+
+
+def sanitize_scene_state(scene, story_state):
+    """Cleans every state-bearing field on one scene in place. With no
+    declaration (legacy story) they are all removed, so a stateless story
+    stays byte-for-byte what the old engine expects. Returns warnings."""
+    sid = scene.get("id", "?")
+    warnings = []
+    if not story_state:
+        for key in ("effects", "routes", "ending_gate", "ending_id"):
+            scene.pop(key, None)
+        for c in scene.get("choices") or []:
+            c.pop("effects", None)
+            c.pop("condition", None)
+        return warnings
+
+    var_index = _state_var_index(story_state)
+
+    eff, w = sanitize_effects(scene.get("effects"), var_index)
+    warnings += [f"{sid}: {x}" for x in w]
+    if eff:
+        scene["effects"] = eff
+    else:
+        scene.pop("effects", None)
+
+    choices = scene.get("choices") or []
+    for c in choices:
+        eff, w = sanitize_effects(c.get("effects"), var_index)
+        warnings += [f"{sid} choice '{c.get('text', '?')}': {x}" for x in w]
+        if eff:
+            c["effects"] = eff
+        else:
+            c.pop("effects", None)
+        cond, err = normalize_condition(c.get("condition"), var_index)
+        if err:
+            warnings.append(f"{sid} choice '{c.get('text', '?')}': {err} — condition removed")
+        if cond is not None:
+            c["condition"] = cond
+        else:
+            c.pop("condition", None)
+    if choices and all(c.get("condition") for c in choices):
+        # Every option locked behind a condition risks a soft-lock. The engine
+        # fails open (shows everything) but a real open option is better.
+        choices[0].pop("condition", None)
+        warnings.append(f"{sid}: every choice was conditional — first choice made always-available")
+
+    routes = scene.get("routes")
+    if routes:
+        if choices:
+            warnings.append(f"{sid}: a scene can't have both choices and routes — routes removed")
+            scene.pop("routes", None)
+        else:
+            kept = []
+            for r in routes if isinstance(routes, list) else []:
+                if not isinstance(r, dict) or not r.get("next_scene"):
+                    continue
+                cond, err = normalize_condition(r.get("condition"), var_index)
+                if err:
+                    warnings.append(f"{sid} route -> {r.get('next_scene')}: {err} — route removed")
+                    continue
+                if cond is None:
+                    # An unconditional route is just the default link.
+                    if not scene.get("next_scene_default"):
+                        scene["next_scene_default"] = r["next_scene"]
+                    continue
+                kept.append({"condition": cond, "next_scene": r["next_scene"]})
+            if kept:
+                scene["routes"] = kept
+                if not scene.get("next_scene_default"):
+                    last = kept.pop()
+                    scene["next_scene_default"] = last["next_scene"]
+                    warnings.append(f"{sid}: routes had no fallback — last route became the default")
+                    if kept:
+                        scene["routes"] = kept
+                    else:
+                        scene.pop("routes", None)
+            else:
+                scene.pop("routes", None)
+
+    if scene.get("ending_gate") is not True:
+        scene.pop("ending_gate", None)
+    if "ending_id" in scene:
+        declared = {e["id"] for e in story_state.get("endings", [])}
+        eid = str(scene.get("ending_id") or "").strip().lower()
+        if eid in declared:
+            scene["ending_id"] = eid
+        else:
+            warnings.append(f"{sid}: ending_id '{scene.get('ending_id')}' is not a declared ending — removed")
+            scene.pop("ending_id", None)
+    return warnings
+
+
+def finalize_ending_gates(all_scenes, story_state, final_chapter_ids):
+    """Wires the declared ending conditions into the finale. The model only
+    marks the gate scene and tags each ending scene; the actual routing is
+    built here from the DECLARED conditions, so it can't drift from them.
+    Also redirects any link that jumps straight to a gated ending scene
+    through the gate instead, so no path can bypass an ending's condition."""
+    warnings = []
+    endings = (story_state or {}).get("endings") or []
+    if not endings:
+        return warnings
+
+    final_ids = set(final_chapter_ids)
+    for s in all_scenes:
+        if s.get("id") not in final_ids and (s.get("ending_gate") or s.get("ending_id")):
+            s.pop("ending_gate", None)
+            s.pop("ending_id", None)
+            warnings.append(f"{s.get('id')}: ending markers are only allowed in the final chapter — removed")
+
+    ending_scene = {}
+    for s in all_scenes:
+        eid = s.get("ending_id")
+        if not eid or s.get("id") not in final_ids:
+            continue
+        if eid in ending_scene:
+            warnings.append(f"{s['id']}: second scene tagged as ending '{eid}' — tag removed")
+            s.pop("ending_id", None)
+            continue
+        ending_scene[eid] = s
+        s.pop("ending_gate", None)
+        for key in ("choices", "choice_prompt", "next_scene_default", "routes"):
+            s.pop(key, None)
+
+    gate = next((s for s in all_scenes if s.get("id") in final_ids and s.get("ending_gate")
+                 and not s.get("ending_id")), None)
+    for s in all_scenes:
+        if s is not gate:
+            s.pop("ending_gate", None)
+    if gate is None:
+        warnings.append("final chapter has no scene marked \"ending_gate\": true — declared ending "
+                        "conditions are NOT enforced for this story")
+        return warnings
+
+    for e in endings:
+        if e["id"] not in ending_scene:
+            warnings.append(f"declared ending '{e['id']}' has no scene tagged with it")
+
+    gate.pop("choices", None)
+    gate.pop("choice_prompt", None)
+    routes = [{"condition": e["condition"], "next_scene": ending_scene[e["id"]]["id"]}
+              for e in endings if e["condition"] is not None and e["id"] in ending_scene]
+    fallback = next((e for e in endings if e["condition"] is None), None)
+    if fallback and fallback["id"] in ending_scene:
+        gate["next_scene_default"] = ending_scene[fallback["id"]]["id"]
+    elif routes:
+        last = routes.pop()
+        gate["next_scene_default"] = last["next_scene"]
+        warnings.append("fallback ending has no scene — the last gated ending became the fallback")
+    else:
+        gate.pop("next_scene_default", None)
+    if routes:
+        gate["routes"] = routes
+    else:
+        gate.pop("routes", None)
+
+    gated_targets = {s["id"] for s in ending_scene.values()}
+    gate_id = gate["id"]
+    for s in all_scenes:
+        if s is gate:
+            continue
+        sid = s.get("id")
+        if s.get("next_scene_default") in gated_targets:
+            warnings.append(f"{sid}: linked straight to ending '{s['next_scene_default']}' — rerouted through the gate")
+            s["next_scene_default"] = gate_id
+        for c in s.get("choices") or []:
+            if c.get("next_scene") in gated_targets:
+                warnings.append(f"{sid}: choice '{c.get('text', '?')}' jumped straight to an ending — rerouted through the gate")
+                c["next_scene"] = gate_id
+        for r in s.get("routes") or []:
+            if r.get("next_scene") in gated_targets:
+                r["next_scene"] = gate_id
+    return warnings
+
+
+def simulate_story_state(final_story, max_states=None, walks=None, max_steps=None, seed=7):
+    """Walks the story the way the engine plays it, state and all.
+    Exhaustive breadth-first search over (scene, state) pairs up to a cap;
+    if the cap is hit, seeded random playthroughs fill in. Reports which
+    endings are reachable, milestone due-day violations (a route where the
+    day counter passes a world event's date before the event happens), and
+    choice scenes where some reachable state locks every option."""
+    decl = final_story.get("state")
+    if not decl:
+        return None
+    max_states = max_states or STATE_SIM_MAX_STATES
+    walks = STATE_SIM_WALKS if walks is None else walks
+    max_steps = max_steps or STATE_SIM_MAX_STEPS
+
+    var_index = _state_var_index(decl)
+    var_ids = list(var_index)
+    by_id = {s["id"]: s for s in final_story.get("scenes", []) if s.get("id")}
+    start = final_story.get("starting_scene") or next(iter(by_id), None)
+    if not start or start not in by_id:
+        return None
+
+    clock_id = next((v["id"] for v in decl["variables"] if v["kind"] == "clock"), None)
+    due = [(v["id"], v["due_day"]) for v in decl["variables"]
+           if v["kind"] == "milestone" and v.get("due_day") is not None] if clock_id else []
+
+    endings_reached, violations, locked = set(), {}, set()
+
+    def key(st):
+        return tuple(st[v] for v in var_ids)
+
+    def arrive(sid, st):
+        st = apply_effects(st, by_id[sid].get("effects"), var_index)
+        for mid, day in due:
+            if st[clock_id] > day and not st[mid] and mid not in violations:
+                violations[mid] = {"milestone": mid, "due_day": day, "scene": sid, "day": st[clock_id]}
+        return st
+
+    def outgoing(sid, st):
+        scene = by_id[sid]
+        choices = scene.get("choices") or []
+        if choices:
+            visible = [c for c in choices if evaluate_condition(st, c.get("condition"))]
+            if not visible:
+                locked.add(sid)
+                visible = choices
+            return [(c.get("next_scene"), apply_effects(st, c.get("effects"), var_index)) for c in visible]
+        for r in scene.get("routes") or []:
+            if r.get("next_scene") and evaluate_condition(st, r.get("condition")):
+                return [(r["next_scene"], st)]
+        nxt = scene.get("next_scene_default")
+        if nxt and nxt in by_id:
+            return [(nxt, st)]
+        return []
+
+    start_state = arrive(start, initial_story_state(decl))
+    seen = {(start, key(start_state))}
+    queue = deque([(start, start_state)])
+    exhaustive = True
+    while queue:
+        sid, st = queue.popleft()
+        outs = outgoing(sid, st)
+        if not outs:
+            endings_reached.add(sid)
+            continue
+        for tgt, st2 in outs:
+            if tgt not in by_id:
+                continue
+            st3 = arrive(tgt, st2)
+            k = (tgt, key(st3))
+            if k in seen:
+                continue
+            if len(seen) >= max_states:
+                exhaustive = False
+                break
+            seen.add(k)
+            queue.append((tgt, st3))
+        if not exhaustive:
+            break
+
+    if not exhaustive:
+        rng = random.Random(seed)
+        for _ in range(walks):
+            sid, st = start, start_state
+            for _ in range(max_steps):
+                outs = outgoing(sid, st)
+                if not outs:
+                    endings_reached.add(sid)
+                    break
+                tgt, st2 = rng.choice(outs)
+                if tgt not in by_id:
+                    break
+                sid, st = tgt, arrive(tgt, st2)
+
+    declared = {}
+    for e in decl.get("endings") or []:
+        scene = next((s for s in final_story.get("scenes", []) if s.get("ending_id") == e["id"]), None)
+        declared[e["id"]] = {
+            "scene": scene["id"] if scene else None,
+            "condition": format_condition(e["condition"]),
+            "reached": bool(scene and scene["id"] in endings_reached),
+        }
+
+    return {
+        "exhaustive": exhaustive,
+        "states_explored": len(seen),
+        "endings_reached": sorted(endings_reached),
+        "declared_endings": declared,
+        "milestone_violations": list(violations.values()),
+        "all_choices_locked_scenes": sorted(locked),
+    }
+
+
+def compute_state_usage(final_story):
+    """Which declared variables are ever changed, and which are ever read."""
+    decl = final_story.get("state") or {}
+    written, read = set(), set()
+
+    def collect_reads(cond):
+        if not isinstance(cond, dict):
+            return
+        for group in ("all", "any"):
+            if isinstance(cond.get(group), list):
+                for c in cond[group]:
+                    collect_reads(c)
+                return
+        if cond.get("var"):
+            read.add(cond["var"])
+
+    for s in final_story.get("scenes", []):
+        written.update((s.get("effects") or {}).keys())
+        for r in s.get("routes") or []:
+            collect_reads(r.get("condition"))
+        for c in s.get("choices") or []:
+            written.update((c.get("effects") or {}).keys())
+            collect_reads(c.get("condition"))
+    for e in decl.get("endings") or []:
+        collect_reads(e.get("condition"))
+    for v in decl.get("variables") or []:
+        if v["kind"] == "milestone" and v.get("due_day") is not None:
+            read.add(v["id"])     # the continuity check reads it
+        if v["kind"] == "clock" and any(x.get("due_day") is not None for x in decl["variables"]):
+            read.add(v["id"])
+
+    ids = [v["id"] for v in decl.get("variables") or []]
+    return {
+        "never_changed": [i for i in ids if i not in written],
+        "never_read": [i for i in ids if i not in read],
+    }
+
+
+def format_state_declaration(story_state):
+    """Compact text rendering of the declaration for chapter/tweak prompts."""
+    lines = []
+    for v in story_state.get("variables", []):
+        if v["kind"] in NUMERIC_KINDS:
+            extra = f" (character: {v['character']})" if v.get("character") else ""
+            lines.append(f"- {v['id']}  [{v['kind']}, integer {v['min']}..{v['max']}, starts {v['initial']}]"
+                         f"{extra} — {v['description'] or v['label']}")
+        else:
+            extra = f" (world event due by day {v['due_day']})" if v.get("due_day") is not None else ""
+            lines.append(f"- {v['id']}  [{v['kind']}, true/false, starts {str(v['initial']).lower()}]"
+                         f"{extra} — {v['description'] or v['label']}")
+    return "\n".join(lines)
+
+
+def build_state_ledger(prior_scenes, story_state):
+    """What the chapters written so far have ACTUALLY done to the state —
+    computed from their effects, not remembered by the model. This is what
+    stops a later chapter from contradicting an earlier one."""
+    if not prior_scenes:
+        return "Nothing yet — this is the first chapter."
+    kinds = {v["id"]: v for v in story_state.get("variables", [])}
+    set_true, touched = {}, {}
+    for s in prior_scenes:
+        sources = [(s.get("id"), s.get("effects") or {})]
+        sources += [(s.get("id"), c.get("effects") or {}) for c in (s.get("choices") or [])]
+        for sid, eff in sources:
+            for var_id, value in eff.items():
+                touched[var_id] = touched.get(var_id, 0) + 1
+                if kinds.get(var_id, {}).get("kind") in BOOLEAN_KINDS and value is True:
+                    set_true.setdefault(var_id, sid)
+    lines = []
+    facts = [f"{k} (first in {v})" for k, v in set_true.items()]
+    lines.append("Flags/milestones already set true on at least one path: " + (", ".join(facts) or "none"))
+    pending = [f"{v['id']}" + (f" (due by day {v['due_day']})" if v.get("due_day") is not None else "")
+               for v in story_state.get("variables", [])
+               if v["kind"] == "milestone" and v["id"] not in set_true]
+    lines.append("Milestones NOT yet set anywhere: " + (", ".join(pending) or "none"))
+    untouched = [v["id"] for v in story_state.get("variables", []) if v["id"] not in touched]
+    lines.append("Variables no scene has changed yet: " + (", ".join(untouched) or "none"))
+    return "\n".join(lines)
+
+
+_STATE_BLOCK_RE = re.compile(r"<story_state>\s*(.*?)\s*</story_state>", re.DOTALL | re.IGNORECASE)
+
+
+def extract_story_state_block(outline):
+    """Pulls the JSON out of the Outline's <story_state> block. Tries the LAST
+    block first (a model that echoes the example usually writes the real one
+    after it) and tolerates a ```json fence inside the tags."""
+    for body in reversed(_STATE_BLOCK_RE.findall(outline or "")):
+        body = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", body.strip())
+        try:
+            parsed = json.loads(clean_json_output(body))
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def strip_story_state_block(outline):
+    """The chapters get the declaration in a formatted form of their own, so
+    the raw JSON block is removed from the outline text they're shown."""
+    return _STATE_BLOCK_RE.sub("", outline or "").strip()
+
+
+def derive_story_state(outline, world_bible, canonical_names, roster_prompt, req, *, budget=None, on_log=None):
+    """Returns (story_state | None, warnings). Reads the Outline's block; if
+    that's missing or unusable, spends ONE extra call asking for the
+    declaration on its own. Anything short of a quota/model wall degrades to
+    None (legacy, stateless story) rather than failing the run."""
+    raw = extract_story_state_block(outline)
+    if raw is not None:
+        decl, warnings = normalize_story_state(raw, canonical_names)
+        if decl:
+            return decl, warnings
+        warnings = ["the Outline's <story_state> block was unusable"] + warnings
+    else:
+        warnings = ["the Outline had no usable <story_state> block"]
+
+    if on_log:
+        on_log("⚠️ Outline came back without a usable state declaration — asking for it on its own "
+               "(1 extra model call).")
+    try:
+        raw_json = call_llm_guarded(
+            STATE_DECLARATION_PROMPT.format(
+                state_spec=STATE_DECLARATION_SPEC,
+                state_example=STATE_DECLARATION_EXAMPLE,
+                roster=roster_prompt,
+                outline=strip_story_state_block(outline),
+                world_bible=world_bible,
+            ),
+            "You design state systems for branching visual novels. Output ONLY valid JSON.",
+            req.provider, req.api_key, req.model_name,
+            label="story-state", budget=budget, on_log=on_log, json_mode=True,
+        )
+        decl, more = normalize_story_state(json.loads(clean_json_output(raw_json)), canonical_names)
+        return decl, warnings + more
+    except (QuotaExhaustedError, ModelUnavailableError):
+        raise
+    except Exception as e:
+        return None, warnings + [f"state declaration call failed ({str(e)[:160]}) — "
+                                 f"this story will run without variables"]
+
+
+def build_chapter_state_section(story_state, chapter_number, num_chapters, prior_scenes):
+    """The {state_section} block of CHAPTER_PROMPT. Empty for a legacy story,
+    so the prompt is exactly what it was before Phase 3."""
+    if not story_state:
+        return ""
+    has_clock = any(v["kind"] == "clock" for v in story_state["variables"])
+    clock_id = next((v["id"] for v in story_state["variables"] if v["kind"] == "clock"), None)
+    plan = next((p for p in story_state.get("chapter_plan", []) if p["chapter"] == chapter_number), None)
+
+    plan_lines = []
+    if plan:
+        if plan.get("day_start") is not None:
+            plan_lines.append(f"- Days this chapter covers: {plan['day_start']} to {plan['day_end']}.")
+        if plan.get("sets_milestones"):
+            plan_lines.append("- Milestones that MUST become true during this chapter: "
+                              + ", ".join(plan["sets_milestones"]) + ".")
+        for bp in plan.get("branch_points") or []:
+            plan_lines.append(f"- Branch point to build (different scenes, not reworded ones): {bp}")
+    plan_text = "\n".join(plan_lines) or "- (no specific plan for this chapter — follow the Outline)"
+
+    clock_rule = (
+        f'- Time only moves through the clock: put "effects": {{"{clock_id}": 1}} on the scene where a new '
+        f"day begins, and keep the day inside this chapter's planned range.\n"
+        if has_clock else ""
+    )
+
+    section = f"""
+**STORY STATE — this story tracks variables. Read carefully.**
+Declared variables (use ONLY these ids, spelled exactly like this):
+{format_state_declaration(story_state)}
+
+This chapter's plan:
+{plan_text}
+
+What earlier chapters have ALREADY done (computed from their scenes — do not contradict it):
+{build_state_ledger(prior_scenes, story_state)}
+
+How to use state in your JSON:
+- "effects" on a CHOICE = what picking it changes, e.g. "effects": {{"trust_bayo": -1, "read_the_file": true}}.
+  Numeric variables take an integer CHANGE (+1, -2), never an absolute value. Flags and milestones take
+  true or false. Tone-only choices have NO effects — leave the key out. Not every choice needs effects,
+  but relationship choices should help one character and cost another.
+- "effects" on a SCENE are applied automatically when the player arrives there — use them for
+  discoveries and world events. A milestone listed above must be set on a scene that EVERY route of this
+  chapter passes through (a scene the branches converge on), never on just one branch.
+{clock_rule}- "condition" on a CHOICE hides it unless true, e.g. "condition": {{"var": "read_the_file", "op": "==", "value": true}}.
+  Use this for options the player has only earned by an earlier choice. At least ONE option in every
+  choice scene must have no condition.
+- "routes" on a scene WITHOUT choices sends the player to a different scene based on state:
+  "routes": [{{"condition": {{"var": "trust_bayo", "op": ">=", "value": 3}}, "next_scene": "..."}}]. Routes are
+  checked in order; the scene MUST still have "next_scene_default" as the fallback.
+- A condition is {{"var", "op", "value"}} or {{"all": [...]}} / {{"any": [...]}}. Numeric: ==, !=, >=, <=, >, <
+  with an integer. Flags/milestones: == or != with true/false.
+"""
+    endings = story_state.get("endings") or []
+    if chapter_number == num_chapters and endings:
+        ending_lines = "\n".join(
+            f'- {e["id"]} ("{e["title"]}"): '
+            + ("FALLBACK — whatever else happened" if e["condition"] is None else format_condition(e["condition"]))
+            for e in endings
+        )
+        section += f"""
+**ENDINGS — this is the final chapter.** The story's endings are declared, and the engine gives the
+player the FIRST one whose condition is true, in this order:
+{ending_lines}
+You MUST include:
+1. Exactly ONE scene with "ending_gate": true — a linear scene (no choices, no routes) that every branch
+   of the finale converges on just before the ending. Give it any placeholder "next_scene_default";
+   the engine wires the real routing from the conditions above.
+2. Exactly ONE ending scene per declared ending, each with "ending_id": "<that ending's id>" and with NO
+   "choices" and NO "next_scene_default". Write each one so it pays off the state that earns it.
+Never link straight to an ending scene — reach them only through the gate.
+"""
+    else:
+        section += '\nDo NOT use "ending_gate" or "ending_id" in this chapter — endings belong to the final chapter.\n'
+    return section
+
+
+def tweak_state_rules(story_state):
+    """Rule 5 of TWEAK_PROMPT."""
+    if not story_state:
+        return ('This story has no state variables. Do not add "effects", "condition" or "routes" fields.')
+    return (
+        'This story tracks state. Keep every "effects" and "condition" exactly as in the original '
+        "scene unless the instruction asks you to change them. If you do change them, use ONLY these "
+        "declared variables (numeric = integer change like +1 or -2; flags/milestones = true/false):\n"
+        + format_state_declaration(story_state)
+        + '\n   Never add, remove or edit "routes", "ending_gate" or "ending_id" — the engine manages those.'
+    )
 
 # ==========================================
 # 4. MULTI-MODEL ADAPTER & PARSER
@@ -1201,9 +2185,9 @@ def normalize_speakers(scenes, canonical_names):
 
 
 def validate_and_repair_scene_graph(all_scenes: list[dict]) -> list[str]:
-    """Walks every next_scene_default and choices[].next_scene reference and
-    makes sure it points at a scene that actually exists in this story. A
-    dangling reference (typo'd id, hallucinated continuation, etc.) is
+    """Walks every next_scene_default, choices[].next_scene and routes[].next_scene
+    reference and makes sure it points at a scene that actually exists in this
+    story. A dangling reference (typo'd id, hallucinated continuation, etc.) is
     treated as an ending — the field is stripped rather than left pointing
     at nothing. This is what stops a story from looping back to scene 1 or
     freezing when it hits a broken link near the end."""
@@ -1234,9 +2218,28 @@ def validate_and_repair_scene_graph(all_scenes: list[dict]) -> list[str]:
                     )
             if kept:
                 scene["choices"] = kept
+                # Removing a choice can leave only conditional ones behind,
+                # which could lock the player out of every option.
+                if all(c.get("condition") for c in kept):
+                    kept[0].pop("condition", None)
             else:
                 scene.pop("choices", None)
                 scene.pop("choice_prompt", None)
+
+        if scene.get("routes"):
+            kept_routes = []
+            for route in scene["routes"]:
+                target = route.get("next_scene")
+                if target and target in valid_ids:
+                    kept_routes.append(route)
+                else:
+                    warnings.append(
+                        f"Scene '{sid}': conditional route to missing scene '{target}' — removed."
+                    )
+            if kept_routes:
+                scene["routes"] = kept_routes
+            else:
+                scene.pop("routes", None)
 
     return warnings
 
@@ -1244,7 +2247,7 @@ def validate_and_repair_scene_graph(all_scenes: list[dict]) -> list[str]:
 def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names,
                        num_chapters, update_task, attempt_no, *, budget=None,
                        chapters_done=None, on_chapter_done=None,
-                       scenes_per_chapter=14):
+                       scenes_per_chapter=14, story_state=None):
     """Runs the chapter-by-chapter generation loop once, start to finish.
 
     `chapters_done` is a {"1": [scene, ...], "2": [...]} map restored from the
@@ -1255,13 +2258,26 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
     so the caller can persist the checkpoint immediately. Losing eight
     chapters' worth of quota to a 429 on chapter nine was the old behaviour.
 
+    `story_state` is the story's declared variables (Phase 3) or None for a
+    legacy, stateless story. When present, every chapter is told the
+    declaration, its own slice of the chapter plan, and a ledger of what the
+    earlier chapters actually did; effects/conditions are sanitized against
+    it; and the final chapter's ending gate is wired from the declared
+    ending conditions.
+
     Returns (all_scenes, starting_scene)."""
     chapters_done = dict(chapters_done or {})
     all_scenes = []
     starting_scene = None
     prev_last_scene = None
     previous_summary = "This is the very beginning."
+    final_chapter_ids = []
 
+    def _log_state_warnings(warns, prog, label):
+        for w in warns[:8]:
+            update_task('generating', label, prog, f"⚠️ State: {w}")
+        if len(warns) > 8:
+            update_task('generating', label, prog, f"⚠️ State: …and {len(warns) - 8} more state fixes.")
 
     for i in range(1, num_chapters + 1):
         base_prog = 25 + int((i / num_chapters) * 55)
@@ -1270,6 +2286,8 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
         cached = chapters_done.get(key)
         if cached:
             scenes = cached
+            for s in scenes:
+                sanitize_scene_state(s, story_state)
             update_task('generating', f"Chapter {i} of {num_chapters} (restored)", base_prog,
                         f"♻️ Chapter {i} restored from checkpoint — 0 model calls spent.")
         else:
@@ -1305,6 +2323,7 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
                     world_bible=world_bible, outline=outline,
                     previous_summary=previous_summary, roster=roster_prompt,
                     scene_count=target_scenes,
+                    state_section=build_chapter_state_section(story_state, i, num_chapters, all_scenes),
                 )
                 try:
                     raw_data = call_llm_guarded(
@@ -1367,12 +2386,19 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
             scenes = deduped
 
             scenes = normalize_speakers(scenes, canonical_names)
+            state_warnings = []
+            for s in scenes:
+                state_warnings += sanitize_scene_state(s, story_state)
+            _log_state_warnings(state_warnings, base_prog, step_msg)
             chapters_done[key] = scenes
             if on_chapter_done:
                 on_chapter_done(i, scenes)
 
         if prev_last_scene:
             target_scene_id = scenes[0]["id"]
+            # The chapter's closing scene hands straight to the next chapter;
+            # a conditional route there would bypass that hand-off.
+            prev_last_scene.pop("routes", None)
             if prev_last_scene.get("choices"):
                 for choice in prev_last_scene["choices"]:
                     choice["next_scene"] = target_scene_id
@@ -1385,6 +2411,12 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
 
         if not starting_scene and i == 1:
             starting_scene = scenes[0]["id"]
+        if i == num_chapters:
+            final_chapter_ids = [s["id"] for s in scenes]
+
+    if story_state:
+        gate_warnings = finalize_ending_gates(all_scenes, story_state, final_chapter_ids)
+        _log_state_warnings(gate_warnings, 82, f"Wiring ending gates (attempt {attempt_no})...")
 
     repair_warnings = validate_and_repair_scene_graph(all_scenes)
     for w in repair_warnings:
@@ -1488,9 +2520,8 @@ def backfill_asset_manifest(world_bible, asset_manifest, provider, api_key, mode
     build_asset_manifest(). A much shorter, targeted list per call means far
     more output budget per entry, so this should succeed even when the full
     first-pass call didn't have room to give every entry real attention.
-    Mutates and returns `asset_manifest`; never raises for an ordinary
-    failure — a failed backfill just leaves the blanks for the creator to
-    fill by hand from the Art tab."""
+    Mutates and returns `asset_manifest`; never raises — a failed backfill
+    just leaves the blanks for the creator to fill by hand from the Art tab."""
     missing_bgs, missing_chars = _find_missing_manifest_descriptions(asset_manifest)
     if not missing_bgs and not missing_chars:
         return asset_manifest
@@ -1523,14 +2554,16 @@ def backfill_asset_manifest(world_bible, asset_manifest, provider, api_key, mode
             if target and c.get("base_description"):
                 target["base_description"] = c["base_description"]
 
-    except (QuotaExhaustedError, ModelUnavailableError):
-        raise
     except Exception as e:
+        # Deliberately soft for EVERY failure, quota and budget walls included:
+        # this is an unplanned extra call, and pausing a finished book at 90%
+        # over a few blank descriptions (which the creator can fill in from
+        # the Art tab) would be far worse than leaving them blank.
         if on_log:
             on_log(f"⚠️ Backfill call failed ({e}) — {len(missing_bgs) + len(missing_chars)} entries "
                    f"are still blank. Fill them in manually from the Art tab, or regenerate the manifest.")
 
-    return asset_manifest    
+    return asset_manifest   
 
 
 def _reachable_scene_ids(final_story):
@@ -1598,7 +2631,10 @@ def find_duplicate_lines(final_story, min_words=6):
 
 def compute_story_stats(final_story):
     """Measures everything measurable in Python so the judge doesn't have to
-    count — and can't get the counting wrong. Cheap, deterministic, free."""
+    count — and can't get the counting wrong. Cheap, deterministic, free.
+    For a story with declared state it also plays the story through the
+    state simulator: which declared endings are really reachable, and
+    whether any route skips a world event past its due day."""
     scenes = final_story.get("scenes", [])
     all_ids = {s.get("id") for s in scenes if s.get("id")}
     reachable = _reachable_scene_ids(final_story)
@@ -1672,6 +2708,33 @@ def compute_story_stats(final_story):
         ],
         "duplicate_line_count": len(duplicate_lines),
     }
+
+    story_state = final_story.get("state")
+    if story_state:
+        sim = simulate_story_state(final_story) or {}
+        usage = compute_state_usage(final_story)
+        all_choices = [c for s in scenes for c in (s.get("choices") or [])]
+        declared = sim.get("declared_endings", {})
+        endings_declared = bool(story_state.get("endings"))
+        stats["story_state"] = {
+            "variables": {v["id"]: v["kind"] for v in story_state.get("variables", [])},
+            "choices_with_effects": sum(1 for c in all_choices if c.get("effects")),
+            "choices_without_effects": sum(1 for c in all_choices if not c.get("effects")),
+            "conditional_choices": sum(1 for c in all_choices if c.get("condition")),
+            "scenes_with_arrival_effects": sum(1 for s in scenes if s.get("effects")),
+            "scenes_with_conditional_routes": sum(1 for s in scenes if s.get("routes")),
+            "ending_gate_present": any(s.get("ending_gate") for s in scenes),
+            "endings_declared": endings_declared,
+            "declared_endings": declared,
+            "declared_endings_missing_scene": sorted(k for k, d in declared.items() if not d["scene"]),
+            "unreachable_declared_endings": sorted(k for k, d in declared.items() if d["scene"] and not d["reached"]),
+            "reachability_exhaustive": sim.get("exhaustive"),
+            "states_explored": sim.get("states_explored"),
+            "milestone_violations": sim.get("milestone_violations", [])[:10],
+            "all_choices_locked_scenes": sim.get("all_choices_locked_scenes", [])[:10],
+            "variables_never_changed": usage["never_changed"],
+            "variables_never_read": usage["never_read"],
+        }
     return stats
 
 
@@ -1687,12 +2750,33 @@ def build_judge_digest(final_story, max_full_scenes=28, max_chars=45000):
     if not scenes:
         return "(story is empty)"
 
+    def fx(effects):
+        parts = []
+        for k, v in (effects or {}).items():
+            parts.append(f"{k} = {str(v).lower()}" if isinstance(v, bool) else f"{k} {v:+d}")
+        return ", ".join(parts)
+
+    lines = []
+    story_state = final_story.get("state")
+    if story_state:
+        lines.append("## STORY STATE (declared variables and ending gates)")
+        lines.append(format_state_declaration(story_state))
+        for e in story_state.get("endings") or []:
+            lines.append(f"ENDING {e['id']} — {e['title']}: "
+                         + ("FALLBACK" if e["condition"] is None else format_condition(e["condition"])))
+        lines.append("")
+
     step = max(1, len(scenes) // max_full_scenes)
     sampled = set(list(range(0, len(scenes), step))[:max_full_scenes])
 
-    lines = []
     for idx, scene in enumerate(scenes):
         header = f"### {scene.get('id')}  [bg: {scene.get('background', '—')}]"
+        if scene.get("ending_gate"):
+            header += "  [ENDING GATE]"
+        if scene.get("ending_id"):
+            header += f"  [ENDING: {scene['ending_id']}]"
+        if scene.get("effects"):
+            header += f"  ON ARRIVAL: {fx(scene['effects'])}"
         sequence = scene.get("sequence", [])
 
         if idx in sampled:
@@ -1712,7 +2796,16 @@ def build_judge_digest(final_story, max_full_scenes=28, max_chars=45000):
         if scene.get("choices"):
             lines.append(f'   CHOICE PROMPT: {scene.get("choice_prompt") or "(MISSING)"}')
             for choice in scene["choices"]:
-                lines.append(f'      -> "{choice.get("text")}"  ==> {choice.get("next_scene")}')
+                extra = ""
+                if choice.get("condition"):
+                    extra += f"  [only if {format_condition(choice['condition'])}]"
+                if choice.get("effects"):
+                    extra += f"  {{{fx(choice['effects'])}}}"
+                lines.append(f'      -> "{choice.get("text")}"  ==> {choice.get("next_scene")}{extra}')
+        elif scene.get("routes"):
+            for route in scene["routes"]:
+                lines.append(f'   -> IF {format_condition(route.get("condition"))} ==> {route.get("next_scene")}')
+            lines.append(f'   -> OTHERWISE ==> {scene.get("next_scene_default") or "[ENDING]"}')
         elif scene.get("next_scene_default"):
             lines.append(f'   -> {scene["next_scene_default"]}')
         else:
@@ -1769,6 +2862,23 @@ def run_judge_evaluation(world_bible, final_story, provider, api_key, model_name
         # different endings/routes) — the ledger-stopped-after-Act-III bug.
         if story_stats.get("duplicate_line_count"):
             failed_params.append("duplicate_lines")
+        # Story-state gates (Phase 3), measured by the simulator, not judged:
+        #  - ending_gates: a declared ending has no scene, the finale has no
+        #    gate, or the search PROVED an ending can never be earned. (If the
+        #    search was capped and only sampled, an unreached ending is left
+        #    as a stat for the Judge rather than a hard fail.)
+        #  - state_continuity: some route lets the day counter pass a world
+        #    event's due day before the event has happened.
+        state_stats = story_stats.get("story_state")
+        if state_stats:
+            if state_stats["endings_declared"] and (
+                state_stats["declared_endings_missing_scene"]
+                or not state_stats["ending_gate_present"]
+                or (state_stats["reachability_exhaustive"] and state_stats["unreachable_declared_endings"])
+            ):
+                failed_params.append("ending_gates")
+            if state_stats["milestone_violations"]:
+                failed_params.append("state_continuity")
 
         overall_score = round(weighted_sum / total_weight, 2) if total_weight else None
         status = "FAIL" if (overall_score is None or overall_score < JUDGE_PASS_SCORE or failed_params) else "PASS"
@@ -1882,14 +2992,16 @@ def run_judge_evaluation_with_fallback(world_bible, final_story, provider, api_k
     # an accurate "paused" state instead of a fake pass.
     raise last_exc
 
-def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name, asset_manifest=None):
+def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name, asset_manifest=None,
+                story_state=None):
     """Rewrites ONE scene per a targeted creator instruction."""
     original_id = scene.get("id")
     raw = call_llm_guarded(
         TWEAK_PROMPT.format(
             world_bible=world_bible or "(none provided)",
             scene_json=json.dumps(scene, ensure_ascii=False),
-            instruction=instruction
+            instruction=instruction,
+            state_rules=tweak_state_rules(story_state),
         ),
         "Output ONLY valid JSON for the single revised scene. Never change 'id' or invent new scene ids.",
         provider, api_key, model_name,
@@ -1905,16 +3017,29 @@ def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name, 
             original_targets.add(c["next_scene"])
     if scene.get("next_scene_default"):
         original_targets.add(scene["next_scene_default"])
+    for r in (scene.get("routes") or []):
+        if r.get("next_scene"):
+            original_targets.add(r["next_scene"])
 
+    # Routes and ending markers are wired by the engine from the declared
+    # ending conditions — never the model's to change. Restore them verbatim.
+    for key in ("routes", "ending_gate", "ending_id"):
+        revised.pop(key, None)
+        if key in scene:
+            revised[key] = json.loads(json.dumps(scene[key]))
+
+    # An empty original target set means the scene was an ENDING. The old
+    # check skipped validation in that case, so a tweak could quietly give an
+    # ending brand-new branches to scenes that don't exist.
     if revised.get("choices"):
         for c in revised["choices"]:
-            if c.get("next_scene") and original_targets and c["next_scene"] not in original_targets:
+            if c.get("next_scene") and c["next_scene"] not in original_targets:
                 raise Exception(
                     f"Model invented a new next_scene id ('{c['next_scene']}') that wasn't in the "
                     f"original scene. Try a more specific instruction (e.g. don't ask it to add a "
                     f"new branch unless you also want to wire it up manually)."
                 )
-    if revised.get("next_scene_default") and original_targets and \
+    if revised.get("next_scene_default") and \
        revised["next_scene_default"] not in original_targets:
         raise Exception(
             f"Model invented a new next_scene_default ('{revised['next_scene_default']}') that wasn't "
@@ -1922,6 +3047,10 @@ def tweak_scene(world_bible, scene, instruction, provider, api_key, model_name, 
         )
 
     normalize_speakers([revised], set())
+
+    # Effects and conditions must only use declared variables with the right
+    # value types; with no declaration (legacy story) they're stripped.
+    sanitize_scene_state(revised, story_state)
 
     # Art is locked after the AI Judge (see build_asset_manifest) — a wording
     # tweak must not be able to sneak in a speaker, expression, or background
@@ -2128,7 +3257,9 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
             )
             outline = call_llm_guarded(
                 OUTLINE_PROMPT.format(target_length=req.target_length, world_bible=world_bible,
-                                      idea_reminder=idea_reminder, reference_reminder=reference_reminder),
+                                      idea_reminder=idea_reminder, reference_reminder=reference_reminder,
+                                      state_spec=STATE_DECLARATION_SPEC,
+                                      state_example=STATE_DECLARATION_EXAMPLE),
                 "You are a master visual novel author.",
                 req.provider, req.api_key, req.model_name,
                 label="outline", budget=budget,
@@ -2136,6 +3267,49 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
             )
             checkpoint["outline"] = outline
             _save_checkpoint(task_id, checkpoint)
+
+        # ---------- STORY STATE DECLARATION (Phase 3) ----------
+        # Decided ONCE per task and stored in the checkpoint, so a resume or a
+        # strict-mode re-roll writes every chapter against the same variables.
+        state_mode = checkpoint.get("story_state_mode")
+        story_state = checkpoint.get("story_state")
+        if state_mode is None:
+            if checkpoint.get("chapters"):
+                # Chapters banked before story state existed have no effects
+                # in them. Mixing formats would give a half-stateful story, so
+                # this run finishes the old way.
+                story_state, state_mode = None, "legacy"
+                update_task('generating', 'Outline ready.', 23,
+                            "ℹ️ This task's chapters were banked before story variables existed — "
+                            "finishing it without them.")
+            else:
+                story_state, state_warnings = derive_story_state(
+                    outline, world_bible, canonical_names, roster_prompt, req,
+                    budget=budget,
+                    on_log=lambda m: update_task('generating', 'Declaring story state...', 23, m),
+                )
+                for w in state_warnings[:12]:
+                    update_task('generating', 'Declaring story state...', 23, f"⚠️ State: {w}")
+                state_mode = "active" if story_state else "legacy"
+            checkpoint["story_state"] = story_state
+            checkpoint["story_state_mode"] = state_mode
+            _save_checkpoint(task_id, checkpoint)
+
+        if story_state:
+            kinds = {}
+            for v in story_state["variables"]:
+                kinds[v["kind"]] = kinds.get(v["kind"], 0) + 1
+            update_task('generating', 'Story state declared.', 24,
+                        f"🧭 Story state: {len(story_state['variables'])} variables "
+                        f"({', '.join(f'{n} {k}' for k, n in kinds.items())}), "
+                        f"{len(story_state.get('endings') or [])} declared endings.")
+        else:
+            update_task('generating', 'Outline ready.', 24,
+                        "ℹ️ No story variables for this run — choices and endings work the classic way.")
+
+        # The chapters receive the declaration in their own formatted section,
+        # so the raw JSON block is stripped out of the outline they're shown.
+        chapter_outline = strip_story_state_block(outline)
 
         # ---------- CHAPTERS (+ optional strict re-roll) ----------
         max_judge_attempts = 2 if judge_mode == "strict" else 1
@@ -2155,12 +3329,13 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
 
         for judge_attempt in range(1, max_judge_attempts + 1):
             all_scenes, starting_scene = write_all_chapters(
-                req, world_bible, outline, roster_prompt, canonical_names,
+                req, world_bible, chapter_outline, roster_prompt, canonical_names,
                 num_chapters, update_task, judge_attempt,
                 budget=budget,
                 chapters_done=checkpoint.get("chapters") or {},
                 on_chapter_done=on_chapter_done,
                 scenes_per_chapter=scenes_per_chapter,
+                story_state=story_state,
             )
 
             final_story = {
@@ -2168,6 +3343,8 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
                 "starting_scene": starting_scene,
                 "scenes": all_scenes
             }
+            if story_state:
+                final_story["state"] = story_state
             checkpoint["final_story"] = final_story
             _save_checkpoint(task_id, checkpoint)
 
@@ -2479,6 +3656,9 @@ def tweak_scene_endpoint(req: TweakSceneRequest):
             req.world_bible, req.scene, req.instruction.strip(),
             req.provider, req.api_key, req.model_name,
             asset_manifest=req.asset_manifest,
+            # Re-normalized here: the declaration arrives from the client and
+            # must meet the same strict shape as a freshly generated one.
+            story_state=normalize_story_state(req.story_state)[0] if req.story_state else None,
         )
         return {"status": "success", "scene": revised_scene}
     except AssetLockError as ale:
