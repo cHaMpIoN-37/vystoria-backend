@@ -72,7 +72,29 @@ DEFAULT_MODELS = {
     "openai": "gpt-4o",
     "claude": "claude-sonnet-4-6",    # stable Sonnet 4 tier — broadest availability
     "grok":   "grok-2-latest",
+    # OpenRouter's own router across whatever models are currently free.
+    # Individual ":free" models come and go every few weeks; this id doesn't.
+    # For a book, pinning ONE model (e.g. nvidia/nemotron-3-ultra-550b-a55b:free)
+    # keeps every chapter in the same voice — the router may switch models
+    # between chapters.
+    "openrouter": "openrouter/free",
 }
+
+# OpenRouter speaks the OpenAI API, so it reuses the openai SDK with this base.
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Optional attribution headers OpenRouter documents for app identification.
+OPENROUTER_HEADERS = {"HTTP-Referer": "https://vystoria-backend.onrender.com", "X-Title": "Vystoria"}
+
+# Display names for creator-facing messages ("Openai"/"Openrouter" from
+# str.title() read as typos).
+PROVIDER_DISPLAY_NAMES = {
+    "gemini": "Gemini", "openai": "OpenAI", "claude": "Claude", "grok": "Grok",
+    "openrouter": "OpenRouter", "cloudflare": "Cloudflare",
+}
+
+
+def _provider_name(provider: str) -> str:
+    return PROVIDER_DISPLAY_NAMES.get((provider or "").lower(), (provider or "").title())
 
 # Image models are a SEPARATE provider+key from the text engine, so a creator
 # can write with (say) OpenAI and draw with Gemini without one eating the
@@ -80,6 +102,10 @@ DEFAULT_MODELS = {
 DEFAULT_IMAGE_MODELS = {
     "gemini": "gemini-2.5-flash-image",
     "openai": "gpt-image-1",
+    # Free on Cloudflare's Workers AI allowance (10,000 neurons/day, hard stop,
+    # no surprise billing on the Workers Free plan). Fixed 1024x1024 JPEG with
+    # no transparency — usable for backgrounds and covers, not character sprites.
+    "cloudflare": "@cf/black-forest-labs/flux-1-schnell",
 }
 
 # Explicit, stated fallback order for the AI Judge specifically. All entries
@@ -91,6 +117,7 @@ JUDGE_MODEL_FALLBACKS = {
     "openai": ["gpt-4o", "gpt-4o-mini"],
     "claude": ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
     "grok":   ["grok-2-latest", "grok-2-beta"],
+    "openrouter": ["openrouter/free"],
 }
 
 # Output-token ceilings. THE SINGLE BIGGEST SOURCE OF WASTED QUOTA in the old
@@ -102,7 +129,9 @@ MAX_OUTPUT_TOKENS = {
     "openai": int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "16384")),
     "claude": int(os.environ.get("CLAUDE_MAX_OUTPUT_TOKENS", "16384")),
     "grok":   int(os.environ.get("GROK_MAX_OUTPUT_TOKENS", "16384")),
+    "openrouter": int(os.environ.get("OPENROUTER_MAX_OUTPUT_TOKENS", "16384")),
 }
+
 
 # Minimum wall-clock spacing between two calls made with the SAME api key.
 # Free-tier Gemini is roughly 10 requests/minute; 4s spacing keeps us under
@@ -182,6 +211,9 @@ def suggested_alternatives(provider: str) -> str:
         return "claude-sonnet-4-6, claude-opus-4-8, claude-haiku-4-5-20251001"
     if provider == "grok":
         return "grok-2-latest, grok-2-beta"
+    if provider == "openrouter":
+        return ("openrouter/free, nvidia/nemotron-3-ultra-550b-a55b:free, "
+                "google/gemma-4-31b-it:free, qwen/qwen3.8-27b:free")
     return "(unknown provider — check the vendor's docs for current model IDs)"
 
 
@@ -261,23 +293,59 @@ RATE_LIMIT_MARKERS = (
 # Substrings that mean "this is a PER-DAY ceiling, not a per-minute one".
 # `GenerateRequestsPerDayPerProjectPerModel-FreeTier` lowercases to contain
 # "perday", which is what catches the exact error in the bug report.
+# NOTE: Gemini's daily-cap message says "check your plan and billing details",
+# so that phrase stays HERE — it is a daily cap that resets, not a billing wall.
 DAILY_QUOTA_MARKERS = (
     "perday",
     "per day",
-    "per-day",
+    "per-day",                 # also OpenRouter's "free-models-per-day"
     "requests per day",
     "daily limit",
     "daily quota",
     "free_tier_requests",
     "generate_content_free_tier_requests",
     "check your plan and billing",
-    "insufficient_quota",
+    "free allocation",         # Cloudflare: "used up your daily free allocation"
+    "neurons",                 # Cloudflare Workers AI's daily unit
+)
+
+# Substrings that pin a 429 to a PER-MINUTE window. Gemini's per-minute and
+# per-day 429s share the same "check your plan and billing details" sentence,
+# so without this a momentary RPM limit was classified as the daily cap and
+# the run stopped, telling the creator to wait until midnight.
+PER_MINUTE_MARKERS = (
+    "perminute",               # GenerateRequestsPerMinutePerProjectPerModel-FreeTier
+    "per minute",
+    "per-min",                 # also OpenRouter's "free-models-per-min"
+    "tokens per min",
+    "requests per min",
+)
+
+# Substrings that mean "the ACCOUNT has no money" — nothing resets at midnight,
+# so telling the creator to wait (which the old code did, because
+# insufficient_quota was lumped in with the daily markers) sends them to wait
+# for a wall that never moves. Checked BEFORE the daily markers.
+BILLING_MARKERS = (
+    "insufficient_quota",      # OpenAI: no credits / monthly budget reached
+    "no credits",
+    "credits remaining",
+    "add credits",
+    "insufficient credits",
+    "requires more credits",   # OpenRouter 402
+    "credit balance",          # Anthropic: "Your credit balance is too low"
+    "payment required",
+    "billing_hard_limit",
+    "billing hard limit",
+    "billing_not_active",
+    "billing is not active",
 )
 
 
 def _classify_rate_limit(exc: Exception):
-    """Returns 'daily', 'transient', or None.
+    """Returns 'billing', 'daily', 'transient', or None.
 
+    'billing'   -> QuotaExhaustedError with a "no credits" message: stop the
+                   run, keep the checkpoint, tell the creator waiting won't help.
     'daily'     -> QuotaExhaustedError, stop the run, keep the checkpoint.
     'transient' -> RateLimitedError, sleep and retry.
     """
@@ -291,10 +359,23 @@ def _classify_rate_limit(exc: Exception):
         "",
     )
 
+    # A billing wall often isn't a 429 at all (OpenRouter sends 402, Anthropic
+    # 400), so it's recognised before the rate-limit gate below.
+    if status.strip() == "402" or any(m in low for m in BILLING_MARKERS):
+        return "billing"
+
     looks_rate_limited = "429" in status or any(m in low for m in RATE_LIMIT_MARKERS)
     if not looks_rate_limited:
         return None
-    if any(m in low for m in DAILY_QUOTA_MARKERS):
+    # Explicit per-DAY wording wins (stop the run). Then explicit per-MINUTE
+    # wording (sleep and retry). Only then the vague shared sentence, which
+    # on its own still means the daily cap.
+    vague = "check your plan and billing"
+    if any(m in low for m in DAILY_QUOTA_MARKERS if m != vague):
+        return "daily"
+    if any(m in low for m in PER_MINUTE_MARKERS):
+        return "transient"
+    if vague in low:
         return "daily"
     return "transient"
 
@@ -349,8 +430,8 @@ class ResumeRequest(BaseModel):
 
 class ImageRequest(BaseModel):
     """One asset, generated on a SEPARATE provider/key from the text engine."""
-    provider: str            # 'gemini' | 'openai'
-    api_key: str
+    provider: str            # 'gemini' | 'openai' | 'cloudflare'
+    api_key: str             # cloudflare: "ACCOUNT_ID:API_TOKEN" (both from the CF dashboard)
     model_name: str | None = None
     prompt: str
     kind: str = "character"  # character | background | cover — drives aspect ratio
@@ -1909,10 +1990,13 @@ def call_llm(prompt, system_instruction, provider, api_key, model_name,
                 )
             return response.text
 
-        elif provider in ('openai', 'grok'):
+        elif provider in ('openai', 'grok', 'openrouter'):
             import openai
             if provider == 'grok':
                 client = openai.OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
+            elif provider == 'openrouter':
+                client = openai.OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL,
+                                       default_headers=OPENROUTER_HEADERS)
             else:
                 client = openai.OpenAI(api_key=api_key)
 
@@ -1920,12 +2004,20 @@ def call_llm(prompt, system_instruction, provider, api_key, model_name,
                 client, resolved_model, system_instruction, prompt,
                 max_tokens, temperature, json_mode,
             )
+            # OpenRouter can answer 200 with no choices (or empty content) when
+            # the free upstream model was overloaded. Raise a plain Exception so
+            # the chapter loop retries, instead of crashing on choices[0].
+            if not getattr(resp, "choices", None):
+                raise Exception(f"{_provider_name(provider)} returned no choices (the upstream model may be overloaded).")
             choice = resp.choices[0]
             if getattr(choice, "finish_reason", None) == "length":
                 raise TruncatedOutputError(
-                    f"{provider.title()} hit its {max_tokens}-token output ceiling before finishing."
+                    f"{_provider_name(provider)} hit its {max_tokens}-token output ceiling before finishing."
                 )
-            return choice.message.content
+            content = getattr(choice.message, "content", None)
+            if not content:
+                raise Exception(f"{_provider_name(provider)} returned an empty response (the upstream model may be overloaded).")
+            return content
 
         elif provider == 'claude':
             import anthropic
@@ -1975,14 +2067,29 @@ def call_llm(prompt, system_instruction, provider, api_key, model_name,
         # Order matters: check rate limits BEFORE model-availability, because
         # _is_model_unavailable() casts a deliberately wide net.
         kind = _classify_rate_limit(e)
-        if kind == "daily":
+        if kind == "billing":
             raise QuotaExhaustedError(
-                f"{provider.title()} has cut you off for the rest of the day on model "
+                f"{_provider_name(provider)} refused the request because this account has no "
+                f"credit left (model '{resolved_model}'). This is a billing limit, not a "
+                f"daily cap — it will NOT reset on its own, so waiting won't help.\n\n"
+                f"👉 Nothing generated so far is lost — this task is checkpointed. Either "
+                f"add credit on {_provider_name(provider)}'s billing page and press Resume, or open "
+                f"Engine Config, switch to a provider with a free tier (Gemini, or "
+                f"OpenRouter with a ':free' model) and resume on that instead.\n\n"
+                f"Vendor said: {err_str.splitlines()[0][:220]}"
+            ) from e
+        if kind == "daily":
+            reset_hint = {
+                "gemini": "midnight US Pacific",
+                "openrouter": "the next day",
+            }.get(provider, "the provider's daily reset")
+            raise QuotaExhaustedError(
+                f"{_provider_name(provider)} has cut you off for the rest of the day on model "
                 f"'{resolved_model}' (free-tier daily request cap).\n\n"
                 f"👉 Nothing generated so far is lost — this task is checkpointed. "
                 f"Open it from the Story Library and press Resume once the quota "
-                f"resets (midnight US Pacific for Gemini), or paste a different "
-                f"provider's key in Engine Config and resume on that instead.\n\n"
+                f"resets ({reset_hint}), or paste a different provider's key in "
+                f"Engine Config and resume on that instead.\n\n"
                 f"Vendor said: {err_str.splitlines()[0][:220]}"
             ) from e
         if kind == "transient":
@@ -3889,6 +3996,74 @@ def _openai_image(api_key, model, prompt, kind):
     raise Exception("OpenAI returned neither b64_json nor a url.")
 
 
+class ImageKindUnsupportedError(Exception):
+    """The provider can generate images, just not THIS kind of asset well
+    enough to be usable (e.g. an opaque square JPEG for a transparent sprite)."""
+
+
+def _cloudflare_image(api_key, model, prompt, kind):
+    """Cloudflare Workers AI. Free within the account's daily neuron allowance.
+
+    The key is "ACCOUNT_ID:API_TOKEN" — Workers AI needs both, and packing them
+    into the one existing key field avoids a new form field and storage column.
+
+    flux-1-schnell (the default) takes only prompt/steps/seed and returns a
+    fixed 1024x1024 JPEG as base64 JSON; some other Workers AI image models
+    return raw PNG bytes instead, so both response shapes are handled."""
+    if kind == "character":
+        # No alpha channel and no aspect control: a portrait would come back as
+        # an opaque square that draws a box around the character in the engine.
+        raise ImageKindUnsupportedError(
+            "Cloudflare's free image model can't make character portraits usable in the "
+            "game: it returns an opaque square JPEG with no transparent background, so the "
+            "character would sit inside a visible box over the scene.\n\n"
+            "👉 Use Cloudflare for backgrounds and the cover, and switch Engine Config → "
+            "Asset Art to OpenAI (gpt-image-1 supports transparency) for portraits — or use "
+            "each tile's Copy button and generate the portrait in an external tool."
+        )
+
+    account_id, sep, token = (api_key or "").strip().partition(":")
+    if not sep or not account_id.strip() or not token.strip():
+        raise ImageKindUnsupportedError(
+            "Cloudflare needs both your Account ID and an API token. Paste them into the "
+            "Image API Key field as ACCOUNT_ID:API_TOKEN (Account ID is on the Cloudflare "
+            "dashboard's Workers AI page; create the token with the 'Workers AI' template)."
+        )
+
+    model = model or DEFAULT_IMAGE_MODELS["cloudflare"]
+    if not model.startswith("@cf/"):
+        model = "@cf/" + model.lstrip("/")
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id.strip()}/ai/run/{model}"
+    body = {"prompt": prompt[:2048]}   # flux-1-schnell's documented prompt limit
+    if "flux-1-schnell" in model:
+        body["steps"] = 4               # its documented default; max 8
+
+    resp = httpx.post(url, headers={"Authorization": f"Bearer {token.strip()}"},
+                      json=body, timeout=120.0)
+
+    if resp.status_code >= 400:
+        detail = resp.text[:400]
+        try:
+            errors = resp.json().get("errors") or []
+            if errors:
+                detail = "; ".join(f"{e.get('code')}: {e.get('message')}" for e in errors)[:400]
+        except Exception:
+            pass
+        err = Exception(f"Cloudflare {resp.status_code}: {detail}")
+        err.status_code = resp.status_code   # lets _classify_rate_limit see a 429/402
+        raise err
+
+    content_type = resp.headers.get("content-type", "")
+    if content_type.startswith("image/"):
+        return base64.b64encode(resp.content).decode("utf-8"), content_type.split(";")[0]
+
+    data = resp.json()
+    image_b64 = (data.get("result") or {}).get("image")
+    if not image_b64:
+        raise Exception(f"Cloudflare returned no image (response keys: {list(data)[:6]}).")
+    return image_b64, "image/jpeg"
+
+
 @app.post("/generate-image")
 def generate_image_endpoint(req: ImageRequest):
     """Returns one image as base64. The CREATOR APP uploads it to Supabase
@@ -3909,17 +4084,30 @@ def generate_image_endpoint(req: ImageRequest):
             image_b64, mime = _gemini_image(req.api_key, model, prompt, req.kind)
         elif provider == "openai":
             image_b64, mime = _openai_image(req.api_key, model, prompt, req.kind)
+        elif provider == "cloudflare":
+            image_b64, mime = _cloudflare_image(req.api_key, model, prompt, req.kind)
         else:
-            raise HTTPException(status_code=400, detail=f"'{provider}' can't generate images. Use gemini or openai.")
+            raise HTTPException(status_code=400, detail=f"'{provider}' can't generate images. Use gemini, openai or cloudflare.")
 
         return {"status": "success", "image_base64": image_b64, "mime_type": mime,
                 "model": model, "prompt_used": prompt}
 
     except HTTPException:
         raise
+    except ImageKindUnsupportedError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         traceback.print_exc()
         kind = _classify_rate_limit(e)
+        if kind == "billing":
+            raise HTTPException(
+                status_code=402,
+                detail=f"The {provider} image key's account has no credit left. This is a billing "
+                       f"limit, not a daily cap, so waiting won't help.\n\n"
+                       f"👉 Add credit on {provider}'s billing page, or switch Engine Config → Asset Art "
+                       f"to Cloudflare (free, backgrounds and cover only). The Copy button on each tile "
+                       f"still works for pasting into an external image tool."
+            )
         if kind == "daily":
             # "limit: 0" is a different animal from "you used your allowance":
             # the model is not on this account's tier at all, so waiting for
