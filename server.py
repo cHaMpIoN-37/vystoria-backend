@@ -107,6 +107,9 @@ DEFAULT_IMAGE_MODELS = {
     # no surprise billing on the Workers Free plan). Fixed 1024x1024 JPEG with
     # no transparency — usable for backgrounds and covers, not character sprites.
     "cloudflare": "@cf/black-forest-labs/flux-1-schnell",
+    # Any OpenRouter model that lists "image" under output modalities works;
+    # this is only the fallback when the creator leaves the model field blank.
+    "openrouter": "google/gemini-2.5-flash-image",
 }
 
 # Explicit, stated fallback order for the AI Judge specifically. All entries
@@ -4435,6 +4438,87 @@ def _cloudflare_image(api_key, model, prompt, kind):
         raise Exception(f"Cloudflare returned no image (response keys: {list(data)[:6]}).")
     return image_b64, "image/jpeg"
 
+def _openrouter_image(api_key, model, prompt, kind):
+    """OpenRouter image generation. One OpenAI-style chat completion with
+    `modalities` set; the picture comes back as a base64 data URL in
+    choices[0].message.images[]. Plain httpx, so no new dependency.
+
+    Models differ on what they accept, so up to three shapes are tried, in
+    order, but ONLY when OpenRouter says the request itself was wrong (400/404).
+    Auth, billing and rate-limit errors are raised straight away — retrying
+    those would just burn a second request against the same wall.
+      1. image+text output with an aspect ratio   (Gemini / GPT-image style)
+      2. image-only output with an aspect ratio   (Flux / Sourceful style)
+      3. image-only output, no image_config       (anything stricter)"""
+    model = (model or DEFAULT_IMAGE_MODELS["openrouter"]).strip()
+    aspect = IMAGE_ASPECTS.get(kind, "1:1")
+
+    attempts = [
+        (["image", "text"], {"aspect_ratio": aspect}),
+        (["image"], {"aspect_ratio": aspect}),
+        (["image"], None),
+    ]
+    headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json",
+               **OPENROUTER_HEADERS}
+
+    last_error = None
+    for modalities, image_config in attempts:
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "modalities": modalities,
+        }
+        if image_config:
+            body["image_config"] = image_config
+
+        resp = httpx.post(f"{OPENROUTER_BASE_URL}/chat/completions", headers=headers,
+                          json=body, timeout=180.0)
+
+        if resp.status_code >= 400:
+            detail = resp.text[:400]
+            try:
+                err_obj = resp.json().get("error") or {}
+                if err_obj.get("message"):
+                    detail = str(err_obj["message"])[:400]
+            except Exception:
+                pass
+            err = Exception(f"OpenRouter {resp.status_code}: {detail}")
+            err.status_code = resp.status_code     # lets _classify_rate_limit see a 402/429
+            if resp.status_code in (400, 404, 422):
+                last_error = err                   # wrong request shape for this model — try the next one
+                continue
+            raise err
+
+        data = resp.json()
+        # OpenRouter can return HTTP 200 with an error object inside.
+        if data.get("error"):
+            err = Exception(f"OpenRouter error: {str(data['error'].get('message') or data['error'])[:400]}")
+            err.status_code = data["error"].get("code")
+            raise err
+
+        message = ((data.get("choices") or [{}])[0].get("message")) or {}
+        for img in message.get("images") or []:
+            url = ((img.get("image_url") or {}).get("url")) or img.get("url") or ""
+            m = re.match(r"^data:(image/[\w.+-]+);base64,(.+)$", url, re.DOTALL)
+            if m:
+                return m.group(2).strip(), m.group(1)
+            if url.startswith("http"):
+                fetched = httpx.get(url, timeout=60.0)
+                fetched.raise_for_status()
+                mime = fetched.headers.get("content-type", "image/png").split(";")[0]
+                return base64.b64encode(fetched.content).decode("utf-8"), mime
+
+        text = message.get("content")
+        if isinstance(text, list):
+            text = " ".join(p.get("text", "") for p in text if isinstance(p, dict))
+        raise Exception(
+            f"'{model}' answered but returned no image"
+            + (f" — it said: {str(text)[:200]}" if text else "")
+            + ". Check that the model lists 'image' under output modalities on openrouter.ai/models."
+        )
+
+    raise last_error or Exception("OpenRouter rejected every request shape for this model.")
+
 
 @app.post("/generate-image")
 def generate_image_endpoint(req: ImageRequest):
@@ -4458,8 +4542,10 @@ def generate_image_endpoint(req: ImageRequest):
             image_b64, mime = _openai_image(req.api_key, model, prompt, req.kind)
         elif provider == "cloudflare":
             image_b64, mime = _cloudflare_image(req.api_key, model, prompt, req.kind)
+        elif provider == "openrouter":
+            image_b64, mime = _openrouter_image(req.api_key, model, prompt, req.kind)
         else:
-            raise HTTPException(status_code=400, detail=f"'{provider}' can't generate images. Use gemini, openai or cloudflare.")
+            raise HTTPException(status_code=400, detail=f"'{provider}' can't generate images. Use gemini, openai, openrouter or cloudflare.")
 
         return {"status": "success", "image_base64": image_b64, "mime_type": mime,
                 "model": model, "prompt_used": prompt}
