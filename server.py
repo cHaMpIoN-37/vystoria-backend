@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import difflib
 import time
 import base64
 import random
@@ -474,12 +475,29 @@ You are a master Visual Novel writer. Create a rich, dark, atmospheric Visual No
 {reference_section}
 
 **Generate the following in structured markdown format:**
-1. **Protagonist**
-2. **Main Characters** (8-12 total)
-3. **Key Locations** (15-20)
+1. **Protagonist** (full profile — same fields as the Main Characters below)
+2. **Main Characters** ({cast_range} total INCLUDING the protagonist — a cast this size can each
+   be introduced properly across {num_chapters} chapters; do not exceed it)
+3. **Key Locations** ({location_range} — each one must be a place the story actually returns to
+   or needs; no filler locations)
 4. **Core Rules & Systems**
 5. **Major Themes** and **Emotional Arc**
 6. **Writing Style Guidelines**
+
+**CHARACTER PROFILE — every character in sections 1 and 2 gets ALL of these fields:**
+- **Role:** protagonist / ally / rival / antagonist / mentor / minor
+- **Appearance:** apparent age, build, skin tone, hair (colour, length, how it sits), full outfit head
+  to toe, and one or two signature props or markings. Be concrete — this exact description is handed
+  to the illustrator and must never change later in the story.
+- **Personality & voice:** 2-3 traits, plus HOW they talk (blunt, formal, joking, clipped; a verbal habit).
+- **Lore:** 2-4 sentences of backstory — where they come from and what shaped them.
+- **Secret / want:** what they hide or want, and the earliest chapter it may be revealed.
+- **Relationship to the protagonist:** how they know each other, or how they will meet.
+- **First appearance:** the chapter number, the location, and the moment they enter the story.
+
+**INTRODUCTION SCHEDULE (critical):** the protagonist is introduced in chapter 1. Spread the rest of
+the cast across chapters 1 to {last_intro_chapter} — at most 2 NEW characters per chapter, so no chapter
+has to explain a crowd. Nobody is first introduced in the final chapter.
 
 **NAMING RULES (critical — read carefully):**
 - Do NOT default to generic fantasy/AI-slop names. AVOID entirely: Kaelen, Kael, Kaelin, Lyra,
@@ -495,27 +513,48 @@ You are a master Visual Novel writer. Create a rich, dark, atmospheric Visual No
   "Amara" and every dialogue line she speaks is attributed to "Amara" — never "Dr. Amara",
   "Okonkwo", or "Dr. Okonkwo".
 
-**REQUIRED — Character Roster block (must appear verbatim, exactly once, at the end of your
-output). Every named character in the story MUST have a line here.**
+**REQUIRED — Character Roster block (must appear verbatim, exactly once). Every named character in
+the story MUST have a line here.**
 ```roster
-- canonical: <ShortName>  | full: <Full Name with title if any>  | expressions: neutral, worried, angry, determined
-- canonical: <ShortName>  | full: <Full Name>                    | expressions: neutral, smug, thoughtful, scared
+- canonical: <ShortName> | full: <Full Name with title if any> | role: protagonist | intro: 1 | expressions: neutral, worried, angry, determined
+- canonical: <ShortName> | full: <Full Name> | role: rival | intro: 2 | expressions: neutral, smug, thoughtful, scared
 ```
-The `canonical` field is what will appear in every dialogue "speaker" field throughout the
-story. Pick 4-8 expressions per character based on their emotional range. Valid expression
-ids are ONLY: neutral, happy, sad, angry, surprised, worried, determined, smug, scared,
-thoughtful. Do not invent new ones.
+`canonical` is what appears in every dialogue "speaker" field. `intro` is the chapter number (1 to
+{last_intro_chapter}) in which that character first appears — it must match their "First appearance"
+field above. Pick 4-8 expressions per character. Valid expression ids are ONLY: neutral, happy, sad,
+angry, surprised, worried, determined, smug, scared, thoughtful. Do not invent new ones.
+
+**REQUIRED — Location Registry block (must appear verbatim, exactly once, at the very end of your
+output, after the roster).** This is the COMPLETE, FIXED list of backdrops the whole story may use —
+one id is exactly one painted image, and no scene may use a place that is not listed here.
+```locations
+- id: clinic_night | name: Field Clinic (night) | look: cramped canvas-roofed clinic, three cots along a sandbagged wall, one low oil lamp throwing hard light downward
+- id: market_day | name: Harbour Market (day) | look: crowded stone quay, striped awnings, fish crates stacked left, bright overhead sun
+```
+Rules: ids are lowercase snake_case. If the same place is needed at two times of day, give it two ids.
+The `look` line is the canon description of that place (architecture, 2-3 landmark objects, light
+source) and is what the artist paints, so make it specific. List {location_range} entries.
 """
+
 
 OUTLINE_PROMPT = """
 Using the World Bible provided below, create a high-level outline for the entire story.
 **Requirements:**
 - {target_length} total
 - Each chapter should have: Chapter Number + Title, 1-2 paragraph summary, Key plot points, Major choices, Emotional tone.
+- Each chapter ALSO states two lines:
+  - **Introduces:** the characters whose first appearance is in this chapter, exactly matching the
+    `intro` numbers in the World Bible roster (write "none" if nobody). For each, one sentence on HOW
+    they enter the story.
+  - **Locations:** which ids from the World Bible's ```locations``` block this chapter uses (2-4 of
+    them). Use only ids that exist in that block, and prefer returning to places the player already knows.
+- Every chapter must open directly where the previous one ended. Do not skip time without saying so.
 - Plan for 3-5 different endings.
 - Plan 2-3 REAL branch points inside the shared chapters: choices that send the player to
   genuinely different scenes (e.g. "follow Ines" vs "go to office hours"), not the same scene
   reached with different wording.
+- Branches must RE-CONVERGE before each chapter ends, so the next chapter can safely assume the
+  same core facts on every route.
 - Put world events on one shared timeline so parallel routes can't contradict each other: an
   event that happens on day 5 happens on day 5 on every route.
 {idea_reminder}
@@ -606,8 +645,24 @@ You are writing Chapter {chapter_number} of the Visual Novel.
 
 **World Bible:**\n{world_bible}
 **Overall Outline:**\n{outline}
-**Previous Chapters Summary:**\n{previous_summary}
+
+**PREVIOUS CHAPTERS — already written, this is CANON:**
+{previous_chapters}
+
+**CONTINUITY RULES (critical):**
+- Chapter {chapter_number} begins directly after the last scene of the previous chapter. Pick up the
+  same moment, place and emotional state — no reset, no unexplained time jump.
+- Every name, injury, object, promise, secret and relationship shown above is fact. Do not contradict,
+  repeat, or re-explain it. Refer back to specific earlier moments (a line, an object, a choice) so
+  the story feels like one continuous thing.
+- The story branches, and the player reaches this chapter by any route. Only build on facts that held
+  on EVERY route, or on facts recorded in the story state. Never assume the player took one particular
+  option from an earlier choice.
+- Do not resolve anything the Outline reserves for a later chapter.
+
 **Character Roster (use these EXACT speaker names — see World Bible):**\n{roster}
+{intro_section}
+{location_section}
 {state_section}
 Write Chapter {chapter_number}. Generate EXACTLY {scene_count} scenes — no more.
 Do not pad past {scene_count}; running long overflows the output-token limit and
@@ -710,6 +765,10 @@ brief an illustrator will work from, plus the store blurb players will read.
 **Background location IDs that actually appear (one entry each, no more/fewer):**
 {backgrounds}
 
+**Where each background is used, with its canon description from the World Bible (keep every
+landmark and the light source it names; add detail, never contradict it):**
+{background_context}
+
 ═══════════════════════════════════════════════════════════════════
 WHAT TO WRITE
 ═══════════════════════════════════════════════════════════════════
@@ -737,6 +796,12 @@ Describe the person and costume ONLY — never the mood, never the setting,
 never the pose or camera. Those come from the expression note and the
 composition rules. 2 to 3 sentences.
 
+The World Bible's "Appearance" field for each character is CANON. Copy age, build,
+skin tone, hair, outfit and signature props from it exactly — do not redesign, rename
+colours, or swap garments. Only add detail where the World Bible is silent. Two
+characters must never share the same silhouette: vary build, hair shape and outfit
+colour so they are told apart at thumbnail size.
+
 Then, for each expression listed for that character, a SHORT phrase covering
 face and posture only — eyebrows, eyes, mouth, head tilt, shoulders. No
 scenery, no lighting, no clothing.
@@ -745,6 +810,10 @@ scenery, no lighting, no clothing.
 the light source and its direction, and the two or three objects that establish
 the place. Write it as an EMPTY stage. No people, no characters, no animals —
 the cast is composited on top at runtime.
+Where a CANON LOOK is given above, that description is the same physical place:
+keep its architecture and landmark objects. Backgrounds that are the same place at
+different times of day (e.g. clinic_day and clinic_night) must share identical
+architecture and landmarks and differ only in light, colour temperature and shadow.
 
 **5. cover** — one poster-style key-art description. A single striking focal
 subject dead centre, readable at thumbnail size. Do NOT describe any lettering,
@@ -2234,7 +2303,9 @@ def clean_json_output(raw_text):
 
 def parse_character_roster(world_bible: str):
     """Extracts the ```roster fenced block from the World Bible.
-    Returns (roster_text_for_prompt, canonical_names_set, expressions_by_char)."""
+    Returns (roster_text_for_prompt, canonical_names_set, expressions_by_char).
+    Same 3-tuple as before; the prompt text now also carries each character's
+    role and the chapter they are first introduced in."""
     m = re.search(r"```roster\s*(.*?)```", world_bible, re.DOTALL | re.IGNORECASE)
     if not m:
         return "(no roster provided — use single-name speakers only)", set(), {}
@@ -2255,10 +2326,237 @@ def parse_character_roster(world_bible: str):
         canonical_names.add(canon)
         exprs = [e.strip() for e in parts.get("expressions", "neutral").split(",") if e.strip()]
         expressions_by_char[canon] = exprs
-        lines_for_prompt.append(f"- {canon} ({parts.get('full', canon)}) — expressions: {', '.join(exprs)}")
+
+        intro_num = re.search(r"\d+", parts.get("intro", "") or "")
+        role = parts.get("role", "")
+        extras = ""
+        if role:
+            extras += f" — {role}"
+        if intro_num:
+            extras += f" — first appears in chapter {intro_num.group()}"
+        lines_for_prompt.append(
+            f"- {canon} ({parts.get('full', canon)}){extras} — expressions: {', '.join(exprs)}"
+        )
 
     return "\n".join(lines_for_prompt) or "(roster block was empty)", canonical_names, expressions_by_char
 
+
+def _split_block_fields(line):
+    return {p.split(":", 1)[0].strip().lower(): p.split(":", 1)[1].strip()
+            for p in line.split("|") if ":" in p}
+
+
+def parse_roster_details(world_bible: str):
+    """{canonical: {"full", "role", "intro"}} — intro is an int chapter number or None."""
+    details = {}
+    m = re.search(r"```roster\s*(.*?)```", world_bible or "", re.DOTALL | re.IGNORECASE)
+    if not m:
+        return details
+    for line in m.group(1).splitlines():
+        line = line.strip().lstrip("-").strip()
+        if not line:
+            continue
+        parts = _split_block_fields(line)
+        canon = parts.get("canonical")
+        if not canon:
+            continue
+        intro_num = re.search(r"\d+", parts.get("intro", "") or "")
+        details[canon] = {
+            "full": parts.get("full", canon),
+            "role": parts.get("role", ""),
+            "intro": int(intro_num.group()) if intro_num else None,
+        }
+    return details
+
+
+def parse_location_registry(world_bible: str):
+    """{location_id: {"name", "look"}} from the ```locations block. Empty dict
+    for stories generated before the registry existed (legacy behaviour)."""
+    registry = {}
+    m = re.search(r"```locations\s*(.*?)```", world_bible or "", re.DOTALL | re.IGNORECASE)
+    if not m:
+        return registry
+    for line in m.group(1).splitlines():
+        line = line.strip().lstrip("-").strip()
+        if not line:
+            continue
+        parts = _split_block_fields(line)
+        loc_id = (parts.get("id") or "").strip().lower()
+        if loc_id and re.match(r"^[a-z][a-z0-9_]*$", loc_id):
+            registry[loc_id] = {"name": parts.get("name", loc_id), "look": parts.get("look", "")}
+    return registry
+
+
+# Prior chapters are sent to the next chapter's prompt as readable script text.
+# ~60k chars is roughly 15k tokens — four full chapters at 14 scenes. Past that,
+# the OLDEST chapters are condensed first so the most recent one stays word-for-word.
+PRIOR_CHAPTERS_CHAR_BUDGET = int(os.environ.get("PRIOR_CHAPTERS_CHAR_BUDGET", "60000"))
+
+# 1 = if a chapter skips a character who was due to be introduced there, spend one
+# extra call to rewrite it. 0 = just log a warning (default; protects free-tier quota).
+INTRO_ENFORCE_RETRY = os.environ.get("INTRO_ENFORCE_RETRY", "0") == "1"
+
+
+def _render_scene_full(scene):
+    lines = [f"[{scene.get('id')}] bg={scene.get('background', '-')}"]
+    for b in scene.get("sequence", []):
+        if b.get("type") == "dialogue":
+            lines.append(f"  {b.get('speaker', '?')} ({b.get('expression', 'neutral')}): {b.get('text', '')}")
+        else:
+            lines.append(f"  [narration] {b.get('text', '')}")
+    if scene.get("choices"):
+        if scene.get("choice_prompt"):
+            lines.append(f"  CHOICE: {scene['choice_prompt']}")
+        for c in scene["choices"]:
+            lines.append(f"    - \"{c.get('text')}\" -> {c.get('next_scene')}")
+    return "\n".join(lines)
+
+
+def _render_scene_digest(scene):
+    seq = scene.get("sequence", [])
+    speakers = sorted({b.get("speaker") for b in seq if b.get("speaker")})
+    last = next((b.get("text", "") for b in reversed(seq) if b.get("text")), "")
+    if len(last) > 160:
+        last = last[:157] + "..."
+    line = f"[{scene.get('id')}] bg={scene.get('background', '-')} speakers: {', '.join(speakers) or '-'}"
+    if last:
+        line += f" | ends: {last}"
+    if scene.get("choices"):
+        line += " | choices: " + "; ".join(str(c.get("text")) for c in scene["choices"])
+    return line
+
+
+def build_previous_chapters_text(chapter_scenes, upto_chapter, budget_chars=None):
+    """Every chapter before `upto_chapter`, as script text. chapter_scenes is
+    {1: [scene, ...], 2: [...]} keyed by int."""
+    budget = budget_chars or PRIOR_CHAPTERS_CHAR_BUDGET
+    done = [n for n in sorted(chapter_scenes) if n < upto_chapter and chapter_scenes[n]]
+    if not done:
+        return "This is the very beginning — no earlier chapters exist."
+    full = {n: "\n".join(_render_scene_full(s) for s in chapter_scenes[n]) for n in done}
+    digest = {n: "\n".join(_render_scene_digest(s) for s in chapter_scenes[n]) for n in done}
+    mode = {n: "full" for n in done}
+
+    def total():
+        return sum(len(full[n]) if mode[n] == "full" else len(digest[n]) for n in done)
+
+    for n in done:                       # oldest first
+        if total() <= budget:
+            break
+        mode[n] = "digest"
+
+    blocks = []
+    for n in done:
+        label = "FULL TEXT" if mode[n] == "full" else "CONDENSED"
+        blocks.append(f"===== CHAPTER {n} ({label}) =====\n" + (full[n] if mode[n] == "full" else digest[n]))
+    return "\n\n".join(blocks)
+
+
+def _speakers_in(scenes):
+    return {b["speaker"] for s in scenes for b in s.get("sequence", [])
+            if b.get("type") == "dialogue" and b.get("speaker")}
+
+
+def build_character_intro_section(chapter_number, roster_details, chapter_scenes):
+    """The {intro_section} block. Who must be introduced NOW, who is already
+    known, and who must stay off-screen until their chapter. Introduction state
+    is computed from what earlier chapters actually contain, not from the plan."""
+    if not roster_details:
+        return ""
+    seen = set()
+    for n, scenes in chapter_scenes.items():
+        if n < chapter_number:
+            seen |= _speakers_in(scenes)
+
+    due, later = [], []
+    for name, d in roster_details.items():
+        if name in seen:
+            continue
+        intro = d.get("intro")
+        if intro is None:
+            continue
+        if intro <= chapter_number:
+            due.append(name)             # planned for now, or slipped from an earlier chapter
+        else:
+            later.append(name)
+    known = sorted(n for n in roster_details if n in seen)
+
+    lines = ["**CHARACTER INTRODUCTIONS (critical — the player must never meet a stranger without being told who they are):**"]
+    if due:
+        lines.append("Introduce in THIS chapter (each MUST speak, and each gets a dedicated introduction beat):")
+        for n in due:
+            d = roster_details[n]
+            lines.append(f"  - {n} ({d['full']}){' — ' + d['role'] if d['role'] else ''}: use their World Bible profile — "
+                         f"Appearance, Personality & voice, Lore, Relationship to the protagonist.")
+        lines.append(
+            "How to write an introduction beat:\n"
+            "  1. As they enter, 1-2 narration blocks show who they are: age, build, the signature detail from\n"
+            "     their Appearance (exactly as the World Bible gives it — never change hair, outfit or props).\n"
+            "  2. Say WHY they are here and how the protagonist knows them or comes to meet them.\n"
+            "  3. Their first lines must sound like their 'Personality & voice' entry, not like a generic narrator.\n"
+            "  4. Reveal ONE concrete piece of their Lore as a hook — an object, a scar, a rumour, another\n"
+            "     character's reaction — not a monologue. Keep their Secret hidden.\n"
+            "  5. Use their canonical name as the speaker from their first line onward.")
+    else:
+        lines.append("No new roster character is scheduled for this chapter.")
+    if known:
+        lines.append("Already introduced (do NOT re-introduce; stay consistent with how they were shown above): "
+                     + ", ".join(known) + ".")
+    if later:
+        lines.append("NOT introduced yet — do NOT show, name or let these characters speak in this chapter: "
+                     + ", ".join(sorted(later)) + ".")
+    lines.append("Any other roster character who speaks for the first time in this chapter gets the same introduction beat.")
+    if chapter_number == 1:
+        lines.append("The protagonist must be established in chapter 1: who they are, what they want, and what "
+                     "their ordinary world looks like, before the plot starts pressing on them.")
+    return "\n".join(lines)
+
+
+def build_location_section(location_registry):
+    """The {location_section} block. Empty for stories with no registry."""
+    if not location_registry:
+        return ""
+    rows = "\n".join(f"- {loc_id} — {d['name']}: {d['look']}" for loc_id, d in location_registry.items())
+    return (
+        "**LOCATIONS — a FIXED set (art exists for exactly these ids and no others):**\n"
+        f"{rows}\n"
+        "- The \"background\" of every scene MUST be one of the ids above, spelled exactly. Never invent a new id.\n"
+        "- Stay in the same background for consecutive scenes unless the characters actually travel. Change place "
+        "only when the story moves, and say so in narration.\n"
+        "- Prefer returning to places the player has already seen over using a new one. This chapter should "
+        "usually use 2-4 of these places.\n"
+        "- Describe the place consistently with its entry above (same landmarks, same light)."
+    )
+
+
+def normalize_backgrounds(scenes, location_registry, carry_from=None):
+    """Snaps each scene's background to a registry id, and carries the previous
+    scene's backdrop forward if a scene omitted it. Returns warnings. No-op for
+    legacy stories (empty registry)."""
+    if not location_registry:
+        return []
+    warnings = []
+    prev_bg = carry_from
+    for scene in scenes:
+        bg = (scene.get("background") or "").strip()
+        if not bg:
+            if prev_bg:
+                scene["background"] = prev_bg
+            continue
+        if bg not in location_registry:
+            key = re.sub(r"[^a-z0-9]+", "_", bg.lower()).strip("_")
+            match = key if key in location_registry else None
+            if not match:
+                close = difflib.get_close_matches(key, list(location_registry), n=1, cutoff=0.72)
+                match = close[0] if close else None
+            if match:
+                warnings.append(f"Scene '{scene.get('id')}': background '{bg}' snapped to '{match}'.")
+                scene["background"] = match
+            else:
+                warnings.append(f"Scene '{scene.get('id')}': background '{bg}' is not in the Location Registry "
+                                f"and has no close match — kept as-is; it will need its own art.")
+        prev_bg = scene.get("background")
+    return warnings
 
 def normalize_speakers(scenes, canonical_names):
     """Rewrites any dialogue speaker that fuzzy-matches a canonical name to that canonical name.
@@ -2357,28 +2655,22 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
                        scenes_per_chapter=14, story_state=None):
     """Runs the chapter-by-chapter generation loop once, start to finish.
 
-    `chapters_done` is a {"1": [scene, ...], "2": [...]} map restored from the
-    task's checkpoint. Any chapter present there is reused verbatim and costs
-    ZERO model calls — this is what makes Resume cheap after a quota wall.
-
-    `on_chapter_done(i, scenes)` is called after each freshly-written chapter
-    so the caller can persist the checkpoint immediately. Losing eight
-    chapters' worth of quota to a 429 on chapter nine was the old behaviour.
-
-    `story_state` is the story's declared variables (Phase 3) or None for a
-    legacy, stateless story. When present, every chapter is told the
-    declaration, its own slice of the chapter plan, and a ledger of what the
-    earlier chapters actually did; effects/conditions are sanitized against
-    it; and the final chapter's ending gate is wired from the declared
-    ending conditions.
+    Every chapter after the first receives ALL earlier chapters as script text
+    (oldest ones condensed only if the char budget is exceeded), a computed
+    list of which characters are already introduced / due now / not yet, and a
+    fixed location registry. Checkpoint / resume / state behaviour is unchanged.
 
     Returns (all_scenes, starting_scene)."""
     chapters_done = dict(chapters_done or {})
     all_scenes = []
     starting_scene = None
     prev_last_scene = None
-    previous_summary = "This is the very beginning."
     final_chapter_ids = []
+
+    roster_details = parse_roster_details(world_bible)
+    location_registry = parse_location_registry(world_bible)
+    chapter_scenes = {}          # {chapter_number: [scene, ...]} — fed to later chapters
+    prev_chapter_last_bg = None
 
     def _log_state_warnings(warns, prog, label):
         for w in warns[:8]:
@@ -2420,15 +2712,28 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
                     "placeholder id; it will be overwritten, so don't worry about it being 'wrong'."
                 )
 
+            previous_chapters = build_previous_chapters_text(chapter_scenes, i)
+            location_section = build_location_section(location_registry)
+            intro_section = build_character_intro_section(i, roster_details, chapter_scenes)
+            seen_before = set()
+            for k, sc in chapter_scenes.items():
+                if k < i:
+                    seen_before |= _speakers_in(sc)
+            planned_intros = [n for n, d in roster_details.items()
+                              if d.get("intro") == i and n not in seen_before]
+
             target_scenes = int(scenes_per_chapter)
             scenes = []
             last_error = None
+            correction = ""
 
             for attempt in range(1, CHAPTER_MAX_RETRIES + 1):
                 prompt = CHAPTER_PROMPT.format(
                     chapter_number=i, chapter_context=chapter_context,
                     world_bible=world_bible, outline=outline,
-                    previous_summary=previous_summary, roster=roster_prompt,
+                    previous_chapters=previous_chapters, roster=roster_prompt,
+                    intro_section=intro_section + correction,
+                    location_section=location_section,
                     scene_count=target_scenes,
                     state_section=build_chapter_state_section(story_state, i, num_chapters, all_scenes),
                 )
@@ -2444,14 +2749,30 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
                     chapter_data = json.loads(clean_json_output(raw_data))
                     scenes = [s for s in chapter_data.get("scenes", []) if s.get("id")]
                     if scenes:
+                        spoken = _speakers_in(scenes)
+                        missing = [n for n in planned_intros if n not in spoken]
+                        if missing and INTRO_ENFORCE_RETRY and attempt < CHAPTER_MAX_RETRIES:
+                            correction = (
+                                "\n\n**CORRECTION — your previous attempt left these characters out: "
+                                + ", ".join(missing) + ". They MUST appear, speak, and receive their "
+                                "introduction beat in this chapter.**"
+                            )
+                            last_error = f"missing introductions: {', '.join(missing)}"
+                            update_task('generating', step_msg, base_prog,
+                                        f"⚠️ Chapter {i} skipped the introduction of {', '.join(missing)}. Retrying...")
+                            scenes = []
+                            time.sleep(2)
+                            continue
+                        if missing:
+                            update_task('generating', step_msg, base_prog,
+                                        f"⚠️ Chapter {i}: {', '.join(missing)} due to be introduced here "
+                                        f"but never speak. Fix with Tweak Scene, or set INTRO_ENFORCE_RETRY=1.")
                         update_task('generating', step_msg, base_prog,
                                     f"Chapter {i} structured and validated ({len(scenes)} scenes).")
                         break
                     last_error = "the model returned zero usable scenes"
 
                 except (ModelUnavailableError, QuotaExhaustedError):
-                    # Terminal — never retried. Re-raised so the pipeline can
-                    # checkpoint and stop cleanly instead of burning the day.
                     raise
 
                 except TruncatedOutputError as te:
@@ -2493,6 +2814,8 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
             scenes = deduped
 
             scenes = normalize_speakers(scenes, canonical_names)
+            for w in normalize_backgrounds(scenes, location_registry, carry_from=prev_chapter_last_bg)[:8]:
+                update_task('generating', step_msg, base_prog, f"🖼️ {w}")
             state_warnings = []
             for s in scenes:
                 state_warnings += sanitize_scene_state(s, story_state)
@@ -2513,8 +2836,9 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
                 prev_last_scene["next_scene_default"] = target_scene_id
 
         all_scenes.extend(scenes)
+        chapter_scenes[i] = scenes
         prev_last_scene = scenes[-1]
-        previous_summary += f"\nChapter {i} completed."
+        prev_chapter_last_bg = scenes[-1].get("background")
 
         if not starting_scene and i == 1:
             starting_scene = scenes[0]["id"]
@@ -2531,9 +2855,43 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
 
     return all_scenes, (starting_scene or "ch1_scene01")
 
+def build_background_context(all_scenes, location_registry):
+    """One line per backdrop: which chapters use it, its canon `look` from the
+    World Bible, and the first narration that happens there. This is what lets
+    the art director describe the place the story ACTUALLY uses, not a guess."""
+    usage = {}
+    for s in all_scenes or []:
+        bg = s.get("background")
+        if not bg:
+            continue
+        m = re.match(r"ch(\d+)_", s.get("id") or "")
+        entry = usage.setdefault(bg, {"chapters": set(), "excerpt": ""})
+        if m:
+            entry["chapters"].add(int(m.group(1)))
+        if not entry["excerpt"]:
+            first = next((b.get("text", "") for b in s.get("sequence", []) if b.get("type") == "narrative"), "")
+            entry["excerpt"] = first[:140].replace("\n", " ")
+    lines = []
+    for bg in sorted(usage):
+        u = usage[bg]
+        chapters = ",".join(str(c) for c in sorted(u["chapters"])) or "?"
+        look = (location_registry.get(bg) or {}).get("look", "")
+        line = f"- {bg} — used in chapter(s) {chapters}"
+        if look:
+            line += f" — CANON LOOK: {look}"
+        if u["excerpt"]:
+            line += f" — first seen: \"{u['excerpt']}\""
+        lines.append(line)
+    return "\n".join(lines) or "(none)"
+
+
 def build_asset_manifest(world_bible, speaker_expressions_map, background_ids,
-                         provider, api_key, model_name, *, budget=None, on_log=None):
+                         provider, api_key, model_name, *, budget=None, on_log=None,
+                         all_scenes=None):
     """Catalogs character/background/cover art descriptions with per-expression variants.
+
+    `all_scenes` (optional) lets the art director see where each backdrop is
+    used and its canon look from the Location Registry.
 
     Never raises for ordinary failures — falls back to a bare-name manifest —
     but a quota wall IS re-raised, because silently degrading to an empty
@@ -2542,13 +2900,15 @@ def build_asset_manifest(world_bible, speaker_expressions_map, background_ids,
         f"- {name}: {', '.join(sorted(exprs)) or 'neutral'}"
         for name, exprs in sorted(speaker_expressions_map.items())
     ) or "(none)"
+    background_context = build_background_context(all_scenes, parse_location_registry(world_bible))
 
     try:
         manifest_raw = call_llm_guarded(
             ASSET_MANIFEST_PROMPT.format(
                 world_bible=world_bible,
                 speaker_expressions=speaker_expressions_text,
-                backgrounds="\n".join(f"- {b}" for b in background_ids) or "(none)"
+                backgrounds="\n".join(f"- {b}" for b in background_ids) or "(none)",
+                background_context=background_context,
             ),
             "Output ONLY valid JSON.", provider, api_key, model_name,
             label="asset-manifest", budget=budget, on_log=on_log, json_mode=True,
@@ -3314,11 +3674,22 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
                             f"Reference document detected ({len(trimmed_reference)} chars) — adapting it "
                             f"instead of freeform generation.")
 
+                        # Scale the cast and the set list to the story's length so every
+            # character can actually be introduced, and every location reused.
+            cast_low = max(4, min(8, num_chapters + 1))
+            cast_high = max(cast_low + 1, min(12, num_chapters + 3))
+            loc_low = max(5, min(12, num_chapters + 2))
+            loc_high = max(loc_low + 1, min(20, num_chapters * 2 + 1))
+
             world_bible = call_llm_guarded(
                 WORLD_PROMPT.format(title=req.title, subtitle=req.subtitle, genre=req.genre,
                                     target_length=req.target_length, tone=req.tone,
                                     idea_section=idea_section, reference_section=reference_section,
-                                    naming_pool=naming_pool),
+                                    naming_pool=naming_pool,
+                                    num_chapters=num_chapters,
+                                    cast_range=f"{cast_low}-{cast_high}",
+                                    location_range=f"{loc_low}-{loc_high}",
+                                    last_intro_chapter=max(1, num_chapters - 1)),
                 "You are a master visual novel author.",
                 req.provider, req.api_key, req.model_name,
                 label="world-bible", budget=budget,
@@ -3534,6 +3905,7 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
                 req.provider, req.api_key, req.model_name,
                 budget=budget,
                 on_log=lambda m: update_task('generating', 'Cataloging assets...', 90, m),
+                all_scenes=all_scenes,
             )
             checkpoint["asset_manifest"] = asset_manifest
             _save_checkpoint(task_id, checkpoint)
