@@ -479,8 +479,9 @@ You are a master Visual Novel writer. Create a rich, dark, atmospheric Visual No
 
 **Generate the following in structured markdown format:**
 1. **Protagonist** (full profile — same fields as the Main Characters below)
-2. **Main Characters** ({cast_range} total INCLUDING the protagonist — a cast this size can each
-   be introduced properly across {num_chapters} chapters; do not exceed it)
+2. **Main Characters** ({cast_range} total INCLUDING the protagonist. This is a TIGHT cast: every
+   one of them must matter. Do not exceed it, and do not add named minor characters — a one-scene
+   role (a guard, a clerk) is a generic descriptor in the script, never a roster entry)
 3. **Key Locations** ({location_range} — each one must be a place the story actually returns to
    or needs; no filler locations)
 4. **Core Rules & Systems**
@@ -497,10 +498,18 @@ You are a master Visual Novel writer. Create a rich, dark, atmospheric Visual No
 - **Secret / want:** what they hide or want, and the earliest chapter it may be revealed.
 - **Relationship to the protagonist:** how they know each other, or how they will meet.
 - **First appearance:** the chapter number, the location, and the moment they enter the story.
+- **Plot function:** the ONE thing this character does that moves the story and that nobody else could
+  do — a specific decision, act, or piece of knowledge, and the chapter it lands in. If the story would
+  play out the same without them, they do not belong in the cast.
+- **Arc:** where they start emotionally, and where they end up by the finale.
 
 **INTRODUCTION SCHEDULE (critical):** the protagonist is introduced in chapter 1. Spread the rest of
 the cast across chapters 1 to {last_intro_chapter} — at most 2 NEW characters per chapter, so no chapter
 has to explain a crowd. Nobody is first introduced in the final chapter.
+
+**CAST ECONOMY (critical):** every character must appear in at least 3 chapters, must be tied to the
+central mystery/conflict, and must affect at least one ending. Relationships between them must create
+pressure (debts, lies, loyalties that conflict) — not just exposition.
 
 **NAMING RULES (critical — read carefully):**
 - Do NOT default to generic fantasy/AI-slop names. AVOID entirely: Kaelen, Kael, Kaelin, Lyra,
@@ -545,13 +554,23 @@ Using the World Bible provided below, create a high-level outline for the entire
 **Requirements:**
 - {target_length} total
 - Each chapter should have: Chapter Number + Title, 1-2 paragraph summary, Key plot points, Major choices, Emotional tone.
-- Each chapter ALSO states two lines:
+- Each chapter ALSO states these lines:
+  - **Chapter question:** the one dramatic question this chapter raises and (partly) answers. The
+    final scene of the chapter must either answer it or open a sharper one.
+  - **Beats:** 5-7 numbered story beats in order. Each beat must follow from the one before it by
+    "therefore" or "but" — never "and then". Every scene of the chapter will be written to serve one
+    of these beats, so nothing in the chapter is filler.
+  - **Character moves:** for each character who matters in this chapter, the one thing they DO that
+    changes the situation (a lie told, a secret exposed, a choice made, help given or withheld).
+    Every main character must make at least one plot-changing move across the story, matching the
+    "Plot function" in their World Bible profile.
   - **Introduces:** the characters whose first appearance is in this chapter, exactly matching the
     `intro` numbers in the World Bible roster (write "none" if nobody). For each, one sentence on HOW
     they enter the story.
   - **Locations:** which ids from the World Bible's ```locations``` block this chapter uses (2-4 of
     them). Use only ids that exist in that block, and prefer returning to places the player already knows.
-- Every chapter must open directly where the previous one ended. Do not skip time without saying so.
+- Chapter N+1 must be a direct CONSEQUENCE of chapter N and open where it ended. Do not skip time
+  without saying so. Every clue, secret and object introduced must pay off later; nothing is decoration.
 - Plan for 3-5 different endings.
 - Plan 2-3 REAL branch points inside the shared chapters: choices that send the player to
   genuinely different scenes (e.g. "follow Ines" vs "go to office hours"), not the same scene
@@ -671,18 +690,48 @@ Write Chapter {chapter_number}. Generate EXACTLY {scene_count} scenes — no mor
 Do not pad past {scene_count}; running long overflows the output-token limit and
 the whole chapter has to be regenerated.
 
-**DIALOGUE-HEAVY PACING (very important — this is a Visual Novel, not a short story):**
-- Target ratio inside "sequence": ~70% dialogue blocks, ~30% narrative blocks.
-- No scene should have more than 2 narrative blocks in a row without a dialogue block breaking it up.
-- Prefer short, punchy dialogue exchanges between multiple characters over long internal monologues.
-- Narrative blocks are for scene-setting and physical action beats ONLY — not for restating what
-  a character just said or explaining feelings the dialogue already showed. Trust the dialogue.
-- A scene with zero dialogue is a code smell — if a scene has no character speaking, ask whether
-  it should be merged with an adjacent scene instead.
+**STORY DRIVE (critical — this is what stops scenes feeling random):**
+- Find this chapter in the Outline and write its Beats IN ORDER. Every scene must serve one beat. If a
+  scene does not advance a beat, change what a character knows, shift a relationship, or raise the
+  stakes, DELETE it. No filler scenes, no wandering, no side plots the Outline does not contain.
+- Each scene must CHANGE something by its last block: a fact learned, a decision made, a lie caught,
+  a relationship shifted, a new threat. A scene where people merely talk and nothing changes is a failure.
+- Use the "Character moves" for this chapter: the characters named there must actually do those things
+  on the page, so each main character visibly drives the plot rather than reacting to it.
+- Pay off earlier setups: bring back specific clues, objects and lines from the PREVIOUS CHAPTERS
+  instead of inventing new ones. Plant at least one concrete clue or tension that the NEXT chapter needs.
+- The chapter's final scene must answer the Outline's chapter question or open a sharper one.
+
+**SCENE CONNECTIVITY (critical — every scene must flow out of the one before it):**
+- A scene's FIRST block must continue the moment the previous scene ended. Either pick up mid-action,
+  or open with a short narrative line that bridges the gap ("Ten minutes later, in the engine room...").
+- If the background changes from the previous scene, the first block MUST be narration that says how and
+  why the characters got there. Never teleport. Keep the same background for consecutive scenes unless
+  they actually travel.
+- A scene's LAST block must set up the next one: an unanswered question, an interruption, an arrival,
+  a decision still pending, or a line that someone reacts to next.
+- A scene that follows a player choice must OPEN by reacting to exactly what the player chose, in the
+  story (a character answers it, the situation reacts to it). The consequence is visible straight away.
+- Two scenes in a row must share at least one character, one object, or one open question. Carry the
+  emotional state across: someone who just got bad news is still shaken in the next scene.
+- Scenes are substantial: 6-10 blocks each (a short one-beat scene only at a real hinge). Let a
+  conversation play out, with reactions, interruptions and subtext, before moving on. Do not rush from
+  one revelation to the next.
+
+**PACING AND DIALOGUE:**
+- Aim for roughly 65% dialogue blocks and 35% narrative blocks inside "sequence".
+- Narrative blocks do real work: bridge time and place, show a physical action or reaction, or give a
+  sensory detail that sets the mood. They never restate what a line of dialogue already showed.
+- Prefer exchanges where characters want different things and push against each other, over speeches.
+  Each line should reveal character, push the plot, or create tension.
+- A scene with zero dialogue should usually be merged into the adjacent scene.
 
 **CHOICE DENSITY:**
-- Give the player a meaningful choice every 2-4 scenes. Aim for 6-9 choice points across the chapter.
-- Choices MUST diverge into different next_scene paths (not two paths that reconverge in one scene).
+- Choices are rarer and weightier than before: aim for 3-5 choice points across the whole chapter,
+  each at a moment of real tension where the story could plausibly go two ways. Most scenes simply
+  continue with "next_scene_default".
+- Each option must lead to its OWN follow-up scene that reacts to that choice. The branches may then
+  rejoin at a shared scene, which must not assume which option the player took.
 - For scenes with NO choices, use "next_scene_default": "next_scene_id".
 - Most choices should have 2 options, but at KEY moments (a turning point, a confession, the
   chapter's climax) use 3 — the third must be a genuine middle path (delay, deflect, ask a
@@ -694,8 +743,7 @@ the whole chapter has to be regenerated.
   - Cruel-honest choices: the truthful option is also the unkind one — honesty and kindness pull apart.
   - Tone-only choices: change how a line lands (warm, sarcastic, blunt) with no score/relationship
     effect at all — these exist purely for voice and characterization.
-  Not every scene needs a different type, but a chapter where all choices reduce to one repeated
-  axis (e.g. every choice is "tell the truth" vs "avoid it") is a failure — the player should not
+  A chapter where all choices reduce to one repeated axis is a failure — the player should not
   be able to predict the "correct" choice after the second one.
 
 **CHOICE FORMATTING RULES:**
@@ -3679,10 +3727,12 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
 
                         # Scale the cast and the set list to the story's length so every
             # character can actually be introduced, and every location reused.
-            cast_low = max(4, min(8, num_chapters + 1))
-            cast_high = max(cast_low + 1, min(12, num_chapters + 3))
-            loc_low = max(5, min(12, num_chapters + 2))
-            loc_high = max(loc_low + 1, min(20, num_chapters * 2 + 1))
+                        # A tight cast where everyone matters beats a crowd nobody can follow:
+            # 5 chapters -> 4-5 characters, 5-7 places.
+            cast_low = max(3, min(6, num_chapters - 1))
+            cast_high = cast_low + 1
+            loc_low = max(4, min(8, num_chapters))
+            loc_high = max(loc_low + 1, min(12, num_chapters + 2))
 
             world_bible = call_llm_guarded(
                 WORLD_PROMPT.format(title=req.title, subtitle=req.subtitle, genre=req.genre,
@@ -3692,7 +3742,7 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
                                     num_chapters=num_chapters,
                                     cast_range=f"{cast_low}-{cast_high}",
                                     location_range=f"{loc_low}-{loc_high}",
-                                    last_intro_chapter=max(1, num_chapters - 1)),
+                                    last_intro_chapter=max(1, num_chapters - 2)),
                 "You are a master visual novel author.",
                 req.provider, req.api_key, req.model_name,
                 label="world-bible", budget=budget,
