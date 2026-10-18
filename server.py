@@ -432,9 +432,22 @@ class ResumeRequest(BaseModel):
     max_llm_calls: int = 0
 
 
+class ReferenceImage(BaseModel):
+    """An image the model should look at while drawing: the place a background
+    variant is painted from, or a style anchor. Base64 without the data: prefix."""
+    data: str
+    mime_type: str = "image/jpeg"
+
+
+# Caps on what a client may attach. The creator app downsizes every reference to
+# 1280px JPEG (~150-400 KB) before sending, so these only stop abuse.
+MAX_REFERENCE_IMAGES = 3
+MAX_REFERENCE_B64_CHARS = 6_000_000
+
+
 class ImageRequest(BaseModel):
     """One asset, generated on a SEPARATE provider/key from the text engine."""
-    provider: str            # 'gemini' | 'openai' | 'cloudflare'
+    provider: str            # 'gemini' | 'openai' | 'openrouter' | 'cloudflare'
     api_key: str             # cloudflare: "ACCOUNT_ID:API_TOKEN" (both from the CF dashboard)
     model_name: str | None = None
     prompt: str
@@ -446,6 +459,11 @@ class ImageRequest(BaseModel):
     # the prompt through untouched. Anything else calling this endpoint can
     # leave it at the default and still get the rules appended server-side.
     compose: bool = True
+    # Images to condition on (img2img / multi-image edit). The FIRST one is the
+    # primary reference: for a background variant, the place it is painted from.
+    # Providers that can't take references (Cloudflare flux-schnell, DALL-E)
+    # ignore them and the response says reference_used=false.
+    reference_images: list[ReferenceImage] | None = None
 
 
 class TweakSceneRequest(BaseModel):
@@ -538,14 +556,22 @@ angry, surprised, worried, determined, smug, scared, thoughtful. Do not invent n
 
 **REQUIRED — Location Registry block (must appear verbatim, exactly once, at the very end of your
 output, after the roster).** This is the COMPLETE, FIXED list of backdrops the whole story may use —
-one id is exactly one painted image, and no scene may use a place that is not listed here.
+one id is exactly one painted image, and no scene may use a background that is not listed here.
 ```locations
-- id: clinic_night | name: Field Clinic (night) | look: cramped canvas-roofed clinic, three cots along a sandbagged wall, one low oil lamp throwing hard light downward
-- id: market_day | name: Harbour Market (day) | look: crowded stone quay, striped awnings, fish crates stacked left, bright overhead sun
+- id: clinic_night | name: Field Clinic (night) | time: night | look: cramped canvas-roofed clinic, three cots along a sandbagged wall, one low oil lamp throwing hard light downward
+- id: clinic_dawn | base: clinic_night | name: Field Clinic (dawn) | time: dawn | change: lamp out, grey dawn light through the canvas seams from the left, one cot stripped and empty
+- id: clinic_cot | base: clinic_night | name: Field Clinic (by the cot) | time: night | view: close on the centre cot and the lamp, sandbag wall filling the background
+- id: market_day | name: Harbour Market (day) | time: day | look: crowded stone quay, striped awnings, fish crates stacked left, bright overhead sun
 ```
-Rules: ids are lowercase snake_case. If the same place is needed at two times of day, give it two ids.
-The `look` line is the canon description of that place (architecture, 2-3 landmark objects, light
-source) and is what the artist paints, so make it specific. List {location_range} entries.
+Rules: ids are lowercase snake_case. Two kinds of line:
+- A PLACE (no `base:`) has a `look`: the canon description (architecture, 2-3 landmark objects, light
+  source) that the artist paints, so make it specific. List {location_range} places.
+- A VARIANT (`base: <place id>`) is the SAME place at another time of day, weather or state (`change:` —
+  what is different) or from another angle (`view:` — where the camera is). It has no `look`; it is
+  painted from its place's image so the two always match. Add a variant whenever the story needs a place
+  at a second time of day or in a changed state, or when a long stretch of scenes stays in one place.
+  Variants are cheap and keep the art consistent — never invent a new place just to show change.
+- `time` is one of dawn, day, dusk, night.
 """
 
 
@@ -857,14 +883,16 @@ Then, for each expression listed for that character, a SHORT phrase covering
 face and posture only — eyebrows, eyes, mouth, head tilt, shoulders. No
 scenery, no lighting, no clothing.
 
-**4. backgrounds** — for each ID, 2 sentences: the location, the time of day,
-the light source and its direction, and the two or three objects that establish
+**4. backgrounds** — for each ID that is a PLACE, 2 sentences: the location, the time of
+day, the light source and its direction, and the two or three objects that establish
 the place. Write it as an EMPTY stage. No people, no characters, no animals —
 the cast is composited on top at runtime.
 Where a CANON LOOK is given above, that description is the same physical place:
-keep its architecture and landmark objects. Backgrounds that are the same place at
-different times of day (e.g. clinic_day and clinic_night) must share identical
-architecture and landmarks and differ only in light, colour temperature and shadow.
+keep its architecture and landmark objects.
+For each ID marked VARIANT OF <place>, write 1-2 sentences that start "The same <place>"
+and describe ONLY what differs — the light (direction, colour), weather, state, or the
+camera angle given as its CHANGE / VIEW. It is painted from the place's image, so do not
+re-describe architecture you are not changing.
 
 **5. cover** — one poster-style key-art description. A single striking focal
 subject dead centre, readable at thumbnail size. Do NOT describe any lettering,
@@ -2420,9 +2448,28 @@ def parse_roster_details(world_bible: str):
     return details
 
 
+_TIME_ALIASES = {
+    "dawn": "dawn", "daybreak": "dawn", "sunrise": "dawn",
+    "morning": "day", "day": "day", "noon": "day", "midday": "day", "afternoon": "day", "daytime": "day",
+    "dusk": "dusk", "evening": "dusk", "sunset": "dusk", "twilight": "dusk",
+    "night": "night", "midnight": "night", "nighttime": "night",
+}
+
+
+def _time_bucket(word):
+    return _TIME_ALIASES.get(re.sub(r"[^a-z]+", "_", (word or "").lower()).strip("_"))
+
+
 def parse_location_registry(world_bible: str):
-    """{location_id: {"name", "look"}} from the ```locations block. Empty dict
-    for stories generated before the registry existed (legacy behaviour)."""
+    """{location_id: {"name", "look", "base", "time", "change", "view"}} from the
+````locations block. Empty dict for stories generated before the registry
+    existed (legacy behaviour).
+
+    A line without `base:` is a PLACE. A line with `base: <place id>` is a
+    VARIANT of it — same architecture and camera, another time / weather /
+    state (`change:`) or another angle (`view:`). The creator app paints every
+    variant FROM its place's image, which is what keeps backgrounds consistent
+    as their number grows."""
     registry = {}
     m = re.search(r"```locations\s*(.*?)```", world_bible or "", re.DOTALL | re.IGNORECASE)
     if not m:
@@ -2433,9 +2480,54 @@ def parse_location_registry(world_bible: str):
             continue
         parts = _split_block_fields(line)
         loc_id = (parts.get("id") or "").strip().lower()
-        if loc_id and re.match(r"^[a-z][a-z0-9_]*$", loc_id):
-            registry[loc_id] = {"name": parts.get("name", loc_id), "look": parts.get("look", "")}
+        if not (loc_id and re.match(r"^[a-z][a-z0-9_]*$", loc_id)):
+            continue
+        name = parts.get("name", loc_id)
+        base = (parts.get("base") or "").strip().lower() or None
+        time_ = _time_bucket(parts.get("time", ""))
+        if not time_:
+            time_ = next((b for b in map(_time_bucket, re.split(r"[^a-z]+", f"{loc_id} {name}".lower())) if b), None)
+        registry[loc_id] = {
+            "name": name, "look": parts.get("look", ""),
+            "base": base if base != loc_id else None,
+            "time": time_, "change": parts.get("change", ""), "view": parts.get("view", ""),
+        }
+    for loc in registry.values():
+        base = registry.get(loc["base"] or "")
+        if loc["base"] and (not base or base.get("base")):
+            loc["base"] = None            # unknown or chained base: treat as its own place
+        elif base and not loc["look"]:
+            loc["look"] = base["look"]
     return registry
+
+
+def attach_background_families(asset_manifest, location_registry):
+    """Copies base/change/view/time from the registry onto the manifest's
+    background entries, and adds an entry for any place that is only ever
+    shown through its variants (`reference_only`) — its image is what those
+    variants are painted from. Mutates and returns the manifest."""
+    if not asset_manifest or not location_registry:
+        return asset_manifest
+    bgs = asset_manifest.setdefault("backgrounds", [])
+    by_id = {b.get("id"): b for b in bgs if b.get("id")}
+    for bid, entry in list(by_id.items()):
+        loc = location_registry.get(bid)
+        if not loc:
+            continue
+        if loc.get("time"):
+            entry["time"] = loc["time"]
+        if loc.get("base"):
+            entry["base"] = loc["base"]
+            for key in ("change", "view"):
+                if loc.get(key):
+                    entry[key] = loc[key]
+            if loc["base"] not in by_id:
+                ref = {"id": loc["base"], "description": "", "reference_only": True}
+                if location_registry[loc["base"]].get("time"):
+                    ref["time"] = location_registry[loc["base"]]["time"]
+                bgs.append(ref)
+                by_id[loc["base"]] = ref
+    return asset_manifest
 
 
 # Prior chapters are sent to the next chapter's prompt as readable script text.
@@ -2567,12 +2659,23 @@ def build_location_section(location_registry):
     """The {location_section} block. Empty for stories with no registry."""
     if not location_registry:
         return ""
-    rows = "\n".join(f"- {loc_id} — {d['name']}: {d['look']}" for loc_id, d in location_registry.items())
+    rows = []
+    for loc_id, d in location_registry.items():
+        if d.get("base"):
+            continue
+        rows.append(f"- {loc_id} — {d['name']} [{d.get('time') or 'any time'}]: {d['look']}")
+        for vid, v in location_registry.items():
+            if v.get("base") == loc_id:
+                what = "; ".join(x for x in (v.get("change"), v.get("view") and f"view: {v['view']}") if x)
+                rows.append(f"    - {vid} — {v['name']} [{v.get('time') or d.get('time') or 'any time'}]: {what}")
     return (
-        "**LOCATIONS — a FIXED set (art exists for exactly these ids and no others):**\n"
-        f"{rows}\n"
+        "**LOCATIONS — a FIXED set (art exists for exactly these ids and no others). Indented ids are VARIANTS "
+        "of the place above them (same place, another time / state / angle):**\n"
+        + "\n".join(rows) + "\n"
         "- The \"background\" of every scene MUST be one of the ids above, spelled exactly. Never invent a new id.\n"
-        "- Stay in the same background for consecutive scenes unless the characters actually travel. Change place "
+        "- Pick the id whose TIME and STATE match what the scene's narration says: a scene that opens in the "
+        "morning never uses a night id. When time passes in a place, switch to its matching variant.\n"
+        "- Stay in the same place for consecutive scenes unless the characters actually travel. Change place "
         "only when the story moves, and say so in narration.\n"
         "- Prefer returning to places the player has already seen over using a new one. This chapter should "
         "usually use 2-4 of these places.\n"
@@ -2908,8 +3011,9 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
 
 def build_background_context(all_scenes, location_registry):
     """One line per backdrop: which chapters use it, its canon `look` from the
-    World Bible, and the first narration that happens there. This is what lets
-    the art director describe the place the story ACTUALLY uses, not a guess."""
+    World Bible (or, for a variant, the place it is painted from and what
+    changes), and the first narration that happens there. Places only shown
+    through their variants are listed too — they still need a description."""
     usage = {}
     for s in all_scenes or []:
         bg = s.get("background")
@@ -2922,14 +3026,26 @@ def build_background_context(all_scenes, location_registry):
         if not entry["excerpt"]:
             first = next((b.get("text", "") for b in s.get("sequence", []) if b.get("type") == "narrative"), "")
             entry["excerpt"] = first[:140].replace("\n", " ")
+    for bg in list(usage):
+        base = (location_registry.get(bg) or {}).get("base")
+        if base and base not in usage:
+            usage[base] = {"chapters": set(), "excerpt": "", "reference_only": True}
     lines = []
     for bg in sorted(usage):
         u = usage[bg]
-        chapters = ",".join(str(c) for c in sorted(u["chapters"])) or "?"
-        look = (location_registry.get(bg) or {}).get("look", "")
+        loc = location_registry.get(bg) or {}
+        chapters = ",".join(str(c) for c in sorted(u["chapters"])) or "none (reference image for its variants)"
         line = f"- {bg} — used in chapter(s) {chapters}"
-        if look:
-            line += f" — CANON LOOK: {look}"
+        if loc.get("time"):
+            line += f" — TIME: {loc['time']}"
+        if loc.get("base"):
+            line += f" — VARIANT OF {loc['base']}"
+            if loc.get("change"):
+                line += f" — CHANGE: {loc['change']}"
+            if loc.get("view"):
+                line += f" — VIEW: {loc['view']}"
+        elif loc.get("look"):
+            line += f" — CANON LOOK: {loc['look']}"
         if u["excerpt"]:
             line += f" — first seen: \"{u['excerpt']}\""
         lines.append(line)
@@ -2951,7 +3067,13 @@ def build_asset_manifest(world_bible, speaker_expressions_map, background_ids,
         f"- {name}: {', '.join(sorted(exprs)) or 'neutral'}"
         for name, exprs in sorted(speaker_expressions_map.items())
     ) or "(none)"
-    background_context = build_background_context(all_scenes, parse_location_registry(world_bible))
+    registry = parse_location_registry(world_bible)
+    background_context = build_background_context(all_scenes, registry)
+    # A place only shown through its variants still needs a description: its
+    # image is what those variants are painted from.
+    background_ids = sorted(set(background_ids) | {
+        registry[b]["base"] for b in background_ids if (registry.get(b) or {}).get("base")
+    })
 
     try:
         manifest_raw = call_llm_guarded(
@@ -2986,6 +3108,9 @@ def build_asset_manifest(world_bible, speaker_expressions_map, background_ids,
         for bg in background_ids:
             if bg not in described_bgs:
                 asset_manifest.setdefault('backgrounds', []).append({"id": bg, "description": ""})
+        # base/change/view/time from the registry, plus an entry for any place
+        # only shown through its variants (the backfill call describes it if blank).
+        attach_background_families(asset_manifest, parse_location_registry(world_bible))
 
         asset_manifest.setdefault("cover", {"description": ""})
         # Both ride along in the manifest call — no extra model request.
@@ -3013,6 +3138,7 @@ def build_asset_manifest(world_bible, speaker_expressions_map, background_ids,
             "synopsis": "",
             "art_direction": "",
         }
+        attach_background_families(fallback, parse_location_registry(world_bible))
         return fallback, str(e)
     
 
@@ -4319,14 +4445,32 @@ def _coerce_image_bytes(data):
     raise Exception("Image payload was neither bytes nor base64 text.")
 
 
-def _gemini_image(api_key, model, prompt, kind="character"):
+def _decode_references(refs):
+    """[(raw_bytes, mime_type), ...] from ReferenceImage objects; bad entries are skipped."""
+    out = []
+    for r in (refs or [])[:MAX_REFERENCE_IMAGES]:
+        try:
+            out.append((base64.b64decode(r.data), r.mime_type or "image/jpeg"))
+        except Exception:
+            continue
+    return out
+
+
+def _gemini_image(api_key, model, prompt, kind="character", refs=None):
     aspect = IMAGE_ASPECTS.get(kind, "1:1")
+    decoded = _decode_references(refs)
 
     try:
         from google import genai as google_genai
         from google.genai import types as google_types
 
         client = google_genai.Client(api_key=api_key)
+
+        # Gemini image models take text + images in one turn and treat the
+        # images as the thing to edit / stay consistent with.
+        contents = prompt
+        if decoded:
+            contents = [prompt] + [google_types.Part.from_bytes(data=raw, mime_type=mime) for raw, mime in decoded]
 
         # image_config lands in different SDK versions at different times, so
         # try it and fall back to a plain call rather than hard-failing on an
@@ -4345,7 +4489,7 @@ def _gemini_image(api_key, model, prompt, kind="character"):
         last_error = None
         for config in config_attempts:
             try:
-                resp = client.models.generate_content(model=model, contents=prompt, config=config)
+                resp = client.models.generate_content(model=model, contents=contents, config=config)
                 for part in resp.candidates[0].content.parts:
                     inline = getattr(part, "inline_data", None)
                     if inline and getattr(inline, "data", None):
@@ -4365,7 +4509,8 @@ def _gemini_image(api_key, model, prompt, kind="character"):
     # Legacy google-generativeai fallback. No aspect-ratio control here.
     import google.generativeai as legacy
     legacy.configure(api_key=api_key)
-    resp = legacy.GenerativeModel(model).generate_content(prompt)
+    contents = [prompt] + [{"mime_type": mime, "data": raw} for raw, mime in decoded] if decoded else prompt
+    resp = legacy.GenerativeModel(model).generate_content(contents)
     for candidate in resp.candidates or []:
         for part in candidate.content.parts:
             inline = getattr(part, "inline_data", None)
@@ -4377,12 +4522,13 @@ def _gemini_image(api_key, model, prompt, kind="character"):
     )
 
 
-def _openai_image(api_key, model, prompt, kind):
+def _openai_image(api_key, model, prompt, kind, refs=None):
     import openai
     client = openai.OpenAI(api_key=api_key)
 
     family = "dalle" if "dall-e" in (model or "").lower() else "openai"
     size = IMAGE_SIZES[family].get(kind, "1024x1024")
+    decoded = _decode_references(refs) if family == "openai" else []   # DALL-E edits need a mask; skip refs
 
     kwargs = {"model": model, "prompt": prompt, "size": size, "n": 1}
 
@@ -4395,8 +4541,16 @@ def _openai_image(api_key, model, prompt, kind):
         kwargs["background"] = "transparent"
         kwargs["output_format"] = "png"
 
+    def call(kw):
+        if decoded:
+            # gpt-image-1's edit endpoint takes several input images and treats
+            # them as the visual reference for the new picture.
+            files = [(f"reference_{i}.{mime.split('/')[-1]}", raw, mime) for i, (raw, mime) in enumerate(decoded)]
+            return client.images.edit(image=files, **kw)
+        return client.images.generate(**kw)
+
     try:
-        resp = client.images.generate(**kwargs)
+        resp = call(kwargs)
     except Exception as e:
         msg = str(e).lower()
         # Older accounts/models reject `background` or `output_format`. Drop the
@@ -4404,10 +4558,10 @@ def _openai_image(api_key, model, prompt, kind):
         if "background" in msg or "output_format" in msg:
             kwargs.pop("background", None)
             kwargs.pop("output_format", None)
-            resp = client.images.generate(**kwargs)
+            resp = call(kwargs)
         elif "size" in msg:
             kwargs["size"] = "1024x1024"
-            resp = client.images.generate(**kwargs)
+            resp = call(kwargs)
         else:
             raise
 
@@ -4488,7 +4642,7 @@ def _cloudflare_image(api_key, model, prompt, kind):
         raise Exception(f"Cloudflare returned no image (response keys: {list(data)[:6]}).")
     return image_b64, "image/jpeg"
 
-def _openrouter_image(api_key, model, prompt, kind):
+def _openrouter_image(api_key, model, prompt, kind, refs=None):
     """OpenRouter image generation. One OpenAI-style chat completion with
     `modalities` set; the picture comes back as a base64 data URL in
     choices[0].message.images[]. Plain httpx, so no new dependency.
@@ -4511,11 +4665,21 @@ def _openrouter_image(api_key, model, prompt, kind):
     headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json",
                **OPENROUTER_HEADERS}
 
+    # References go in the same user turn as OpenAI-style image_url parts.
+    decoded = _decode_references(refs)
+    if decoded:
+        user_content = [{"type": "text", "text": prompt}] + [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"}}
+            for raw, mime in decoded
+        ]
+    else:
+        user_content = prompt
+
     last_error = None
     for modalities, image_config in attempts:
         body = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": user_content}],
             "modalities": modalities,
         }
         if image_config:
@@ -4584,21 +4748,30 @@ def generate_image_endpoint(req: ImageRequest):
     model = (req.model_name or DEFAULT_IMAGE_MODELS.get(provider) or "").strip()
     prompt = _compose_image_prompt(req)
 
+    refs = [r for r in (req.reference_images or []) if r and r.data][:MAX_REFERENCE_IMAGES]
+    if any(len(r.data) > MAX_REFERENCE_B64_CHARS for r in refs):
+        raise HTTPException(status_code=413, detail="A reference image is too large — keep each under about 4 MB.")
+    # Who can actually look at a reference. Cloudflare's flux-schnell is text-only
+    # and DALL-E edits need a mask, so those draw from the prompt alone.
+    takes_refs = provider in ("gemini", "openrouter") or (provider == "openai" and "dall-e" not in model.lower())
+    used_refs = refs if takes_refs else []
+
     try:
         _throttle(req.api_key)
         if provider == "gemini":
-            image_b64, mime = _gemini_image(req.api_key, model, prompt, req.kind)
+            image_b64, mime = _gemini_image(req.api_key, model, prompt, req.kind, used_refs)
         elif provider == "openai":
-            image_b64, mime = _openai_image(req.api_key, model, prompt, req.kind)
+            image_b64, mime = _openai_image(req.api_key, model, prompt, req.kind, used_refs)
         elif provider == "cloudflare":
             image_b64, mime = _cloudflare_image(req.api_key, model, prompt, req.kind)
         elif provider == "openrouter":
-            image_b64, mime = _openrouter_image(req.api_key, model, prompt, req.kind)
+            image_b64, mime = _openrouter_image(req.api_key, model, prompt, req.kind, used_refs)
         else:
             raise HTTPException(status_code=400, detail=f"'{provider}' can't generate images. Use gemini, openai, openrouter or cloudflare.")
 
         return {"status": "success", "image_base64": image_b64, "mime_type": mime,
-                "model": model, "prompt_used": prompt}
+                "model": model, "prompt_used": prompt,
+                "reference_used": bool(used_refs), "references_sent": len(refs)}
 
     except HTTPException:
         raise
