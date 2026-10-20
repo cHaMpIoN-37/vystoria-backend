@@ -105,7 +105,8 @@ DEFAULT_IMAGE_MODELS = {
     "openai": "gpt-image-1",
     # Free on Cloudflare's Workers AI allowance (10,000 neurons/day, hard stop,
     # no surprise billing on the Workers Free plan). Fixed 1024x1024 JPEG with
-    # no transparency — usable for backgrounds and covers, not character sprites.
+    # no transparency and no reference-image input. Fine for free test portraits
+    # and covers; backgrounds drawn with it can't be matched to each other.
     "cloudflare": "@cf/black-forest-labs/flux-1-schnell",
     # Any OpenRouter model that lists "image" under output modalities works;
     # this is only the fallback when the creator leaves the model field blank.
@@ -500,8 +501,9 @@ You are a master Visual Novel writer. Create a rich, dark, atmospheric Visual No
 2. **Main Characters** ({cast_range} total INCLUDING the protagonist. This is a TIGHT cast: every
    one of them must matter. Do not exceed it, and do not add named minor characters — a one-scene
    role (a guard, a clerk) is a generic descriptor in the script, never a roster entry)
-3. **Key Locations** ({location_range} — each one must be a place the story actually returns to
-   or needs; no filler locations)
+3. **Key Locations** (at least {place_min} PLACES, plus VARIANTS of them — see the Location Registry
+   rules at the end. There is NO upper limit: every entry must be used by the story, and every scene
+   should get a backdrop that matches its time of day and state)
 4. **Core Rules & Systems**
 5. **Major Themes** and **Emotional Arc**
 6. **Writing Style Guidelines**
@@ -565,12 +567,17 @@ one id is exactly one painted image, and no scene may use a background that is n
 ```
 Rules: ids are lowercase snake_case. Two kinds of line:
 - A PLACE (no `base:`) has a `look`: the canon description (architecture, 2-3 landmark objects, light
-  source) that the artist paints, so make it specific. List {location_range} places.
+  source) that the artist paints, so make it specific. List at least {place_min} places.
 - A VARIANT (`base: <place id>`) is the SAME place at another time of day, weather or state (`change:` —
   what is different) or from another angle (`view:` — where the camera is). It has no `look`; it is
-  painted from its place's image so the two always match. Add a variant whenever the story needs a place
-  at a second time of day or in a changed state, or when a long stretch of scenes stays in one place.
-  Variants are cheap and keep the art consistent — never invent a new place just to show change.
+  painted from its place's image, so the two always match.
+- VARIANTS ARE HOW THE BACKGROUNDS TRACK THE STORY, and there is no cap on them. Give each place a variant
+  for every time of day, weather or state the story visits it in (before and after a fight, lamp lit and
+  lamp out, door open and door sealed, ordinary and wrecked), and a `view:` variant for any place where a
+  long stretch of scenes happens (a close-up on the object a scene is about, the doorway seen from
+  inside). Write at least {variant_min} variants in total. Read your own plot: a scene that will happen
+  in the rain, at dawn, or after something broke gets its own entry. Never invent a new place just to
+  show change; that is what a variant is for.
 - `time` is one of dawn, day, dusk, night.
 """
 
@@ -593,8 +600,10 @@ Using the World Bible provided below, create a high-level outline for the entire
   - **Introduces:** the characters whose first appearance is in this chapter, exactly matching the
     `intro` numbers in the World Bible roster (write "none" if nobody). For each, one sentence on HOW
     they enter the story.
-  - **Locations:** which ids from the World Bible's ```locations``` block this chapter uses (2-4 of
-    them). Use only ids that exist in that block, and prefer returning to places the player already knows.
+  - **Locations:** which ids from the World Bible's ```locations``` block this chapter uses — list EVERY
+    place and variant its scenes will need, matching the time of day and state each scene shows (a chapter
+    that runs from one evening into the next dawn lists both the night id and the dawn id). There is no
+    cap. Use only ids that exist in that block.
 - Chapter N+1 must be a direct CONSEQUENCE of chapter N and open where it ended. Do not skip time
   without saying so. Every clue, secret and object introduced must pay off later; nothing is decoration.
 - Plan for 3-5 different endings.
@@ -889,6 +898,9 @@ the place. Write it as an EMPTY stage. No people, no characters, no animals —
 the cast is composited on top at runtime.
 Where a CANON LOOK is given above, that description is the same physical place:
 keep its architecture and landmark objects.
+Each line above also quotes what that backdrop's scenes narrate. Paint for those moments: if they mention
+rain, a smashed window, a lamp burnt out or a particular hour, the description shows exactly that, not a
+neutral version of the place.
 For each ID marked VARIANT OF <place>, write 1-2 sentences that start "The same <place>"
 and describe ONLY what differs — the light (direction, colour), weather, state, or the
 camera angle given as its CHANGE / VIEW. It is painted from the place's image, so do not
@@ -2673,12 +2685,15 @@ def build_location_section(location_registry):
         "of the place above them (same place, another time / state / angle):**\n"
         + "\n".join(rows) + "\n"
         "- The \"background\" of every scene MUST be one of the ids above, spelled exactly. Never invent a new id.\n"
-        "- Pick the id whose TIME and STATE match what the scene's narration says: a scene that opens in the "
-        "morning never uses a night id. When time passes in a place, switch to its matching variant.\n"
+        "- Choose the id that matches what the scene SHOWS: its place, its TIME and its STATE. Read your own "
+        "narration: a scene that opens in the morning never uses a night id; rain, a broken window, a lamp going "
+        "out, a door left open — if an indented variant shows that, use it. When time passes or something "
+        "changes in a place, switch to the matching variant.\n"
+        "- Use as many of these ids as the chapter's scenes need. There is no limit per chapter. In a long "
+        "stretch that stays in one place, move between its angle (view) and state variants at natural beats "
+        "instead of holding one image; but never switch without a reason the narration shows.\n"
         "- Stay in the same place for consecutive scenes unless the characters actually travel. Change place "
         "only when the story moves, and say so in narration.\n"
-        "- Prefer returning to places the player has already seen over using a new one. This chapter should "
-        "usually use 2-4 of these places.\n"
         "- Describe the place consistently with its entry above (same landmarks, same light)."
     )
 
@@ -3012,30 +3027,37 @@ def write_all_chapters(req, world_bible, outline, roster_prompt, canonical_names
 def build_background_context(all_scenes, location_registry):
     """One line per backdrop: which chapters use it, its canon `look` from the
     World Bible (or, for a variant, the place it is painted from and what
-    changes), and the first narration that happens there. Places only shown
-    through their variants are listed too — they still need a description."""
+    changes), and what the narration of up to three of its scenes says. Those
+    excerpts are what let the art director paint rain as rain and a dead lamp
+    as a dead lamp. Places only shown through their variants are listed too —
+    they still need a description."""
     usage = {}
     for s in all_scenes or []:
         bg = s.get("background")
         if not bg:
             continue
         m = re.match(r"ch(\d+)_", s.get("id") or "")
-        entry = usage.setdefault(bg, {"chapters": set(), "excerpt": ""})
+        entry = usage.setdefault(bg, {"chapters": set(), "scenes": 0, "excerpts": []})
+        entry["scenes"] += 1
         if m:
             entry["chapters"].add(int(m.group(1)))
-        if not entry["excerpt"]:
+        if len(entry["excerpts"]) < 3:
             first = next((b.get("text", "") for b in s.get("sequence", []) if b.get("type") == "narrative"), "")
-            entry["excerpt"] = first[:140].replace("\n", " ")
+            first = first[:150].replace("\n", " ").strip()
+            if first and first not in entry["excerpts"]:
+                entry["excerpts"].append(first)
     for bg in list(usage):
         base = (location_registry.get(bg) or {}).get("base")
         if base and base not in usage:
-            usage[base] = {"chapters": set(), "excerpt": "", "reference_only": True}
+            usage[base] = {"chapters": set(), "scenes": 0, "excerpts": []}
     lines = []
     for bg in sorted(usage):
         u = usage[bg]
         loc = location_registry.get(bg) or {}
         chapters = ",".join(str(c) for c in sorted(u["chapters"])) or "none (reference image for its variants)"
         line = f"- {bg} — used in chapter(s) {chapters}"
+        if u["scenes"]:
+            line += f" ({u['scenes']} scene{'s' if u['scenes'] != 1 else ''})"
         if loc.get("time"):
             line += f" — TIME: {loc['time']}"
         if loc.get("base"):
@@ -3046,8 +3068,8 @@ def build_background_context(all_scenes, location_registry):
                 line += f" — VIEW: {loc['view']}"
         elif loc.get("look"):
             line += f" — CANON LOOK: {loc['look']}"
-        if u["excerpt"]:
-            line += f" — first seen: \"{u['excerpt']}\""
+        if u["excerpts"]:
+            line += " — what its scenes narrate: " + " / ".join(f'"{e}"' for e in u["excerpts"])
         lines.append(line)
     return "\n".join(lines) or "(none)"
 
@@ -3857,8 +3879,12 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
             # 5 chapters -> 4-5 characters, 5-7 places.
             cast_low = max(3, min(6, num_chapters - 1))
             cast_high = cast_low + 1
-            loc_low = max(4, min(8, num_chapters))
-            loc_high = max(loc_low + 1, min(12, num_chapters + 2))
+            # Floors, not ceilings. Backgrounds are now painted from each other
+            # (a variant from its place, a new place against a style anchor), so
+            # more of them no longer means drift, and more of them is what keeps
+            # the art matched to the scene.
+            place_min = max(5, num_chapters)
+            variant_min = max(6, num_chapters * 2)
 
             world_bible = call_llm_guarded(
                 WORLD_PROMPT.format(title=req.title, subtitle=req.subtitle, genre=req.genre,
@@ -3867,7 +3893,8 @@ def run_generation_pipeline(task_id: str, req, resume: bool = False):
                                     naming_pool=naming_pool,
                                     num_chapters=num_chapters,
                                     cast_range=f"{cast_low}-{cast_high}",
-                                    location_range=f"{loc_low}-{loc_high}",
+                                    place_min=place_min,
+                                    variant_min=variant_min,
                                     last_intro_chapter=max(1, num_chapters - 2)),
                 "You are a master visual novel author.",
                 req.provider, req.api_key, req.model_name,
@@ -4580,6 +4607,48 @@ class ImageKindUnsupportedError(Exception):
     enough to be usable (e.g. an opaque square JPEG for a transparent sprite)."""
 
 
+# flux-1-schnell's documented prompt limit.
+CLOUDFLARE_PROMPT_LIMIT = 2048
+
+# flux has no negative prompt, and a long "do NOT draw ..." tail makes diffusion
+# models draw those things. The full composed prompt is also ~2,500 characters,
+# so it used to be cut off in the middle of the negatives. Cloudflare therefore
+# gets what the picture IS (SUBJECT + ART STYLE) plus one short, positive framing
+# line for the kind of asset.
+CLOUDFLARE_KIND_SUFFIX = {
+    "character": (
+        "Upper-body portrait of one single figure, waist up, facing the viewer, centred, on a plain flat "
+        "solid light-grey background with nothing else in the frame. Flat 2D cel-shaded illustration, clean line art."
+    ),
+    "background": (
+        "Wide 16:9 landscape of an empty environment with nobody in it, eye-level establishing shot. "
+        "Flat 2D cel-shaded illustration, clean line art, everything in focus."
+    ),
+    "cover": (
+        "Poster-style key art, one clear focal subject dead centre, bold readable silhouette, no lettering. "
+        "Flat 2D cel-shaded illustration, clean line art."
+    ),
+}
+
+_COMPOSED_HEADINGS = r"REFERENCE IMAGE|STYLE REFERENCE|ART STYLE|FORMAT|COMPOSITION|MUST NOT INCLUDE"
+
+
+def _cloudflare_prompt(prompt, kind):
+    """The creator app's composed prompt, boiled down to SUBJECT + ART STYLE + a
+    one-line framing for `kind`, within flux's limit. A prompt that was not
+    composed that way (another API client) is only truncated."""
+    def section(name):
+        m = re.search(rf"^{name}\n(.*?)(?=\n\n(?:SUBJECT|{_COMPOSED_HEADINGS})\n|\Z)", prompt, re.DOTALL | re.MULTILINE)
+        return m.group(1).strip() if m else ""
+
+    subject, style = section("SUBJECT"), section("ART STYLE")
+    if not subject:
+        return prompt[:CLOUDFLARE_PROMPT_LIMIT]
+    tail = "\n\n".join(x for x in (style, CLOUDFLARE_KIND_SUFFIX.get(kind, "")) if x)
+    room = max(200, CLOUDFLARE_PROMPT_LIMIT - len(tail) - 2)
+    return f"{subject[:room]}\n\n{tail}"[:CLOUDFLARE_PROMPT_LIMIT]
+
+
 def _cloudflare_image(api_key, model, prompt, kind):
     """Cloudflare Workers AI. Free within the account's daily neuron allowance.
 
@@ -4588,19 +4657,11 @@ def _cloudflare_image(api_key, model, prompt, kind):
 
     flux-1-schnell (the default) takes only prompt/steps/seed and returns a
     fixed 1024x1024 JPEG as base64 JSON; some other Workers AI image models
-    return raw PNG bytes instead, so both response shapes are handled."""
-    if kind == "character":
-        # No alpha channel and no aspect control: a portrait would come back as
-        # an opaque square that draws a box around the character in the engine.
-        raise ImageKindUnsupportedError(
-            "Cloudflare's free image model can't make character portraits usable in the "
-            "game: it returns an opaque square JPEG with no transparent background, so the "
-            "character would sit inside a visible box over the scene.\n\n"
-            "👉 Use Cloudflare for backgrounds and the cover, and switch Engine Config → "
-            "Asset Art to OpenAI (gpt-image-1 supports transparency) for portraits — or use "
-            "each tile's Copy button and generate the portrait in an external tool."
-        )
+    return raw PNG bytes instead, so both response shapes are handled.
 
+    Every kind is allowed, character portraits included. The picture is always an
+    opaque square with no transparency, so a portrait made here shows as a box
+    over the scene in the game: good enough for testing, not for publishing."""
     account_id, sep, token = (api_key or "").strip().partition(":")
     if not sep or not account_id.strip() or not token.strip():
         raise ImageKindUnsupportedError(
@@ -4613,7 +4674,7 @@ def _cloudflare_image(api_key, model, prompt, kind):
     if not model.startswith("@cf/"):
         model = "@cf/" + model.lstrip("/")
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id.strip()}/ai/run/{model}"
-    body = {"prompt": prompt[:2048]}   # flux-1-schnell's documented prompt limit
+    body = {"prompt": _cloudflare_prompt(prompt, kind)}
     if "flux-1-schnell" in model:
         body["steps"] = 4               # its documented default; max 8
 
@@ -4786,7 +4847,7 @@ def generate_image_endpoint(req: ImageRequest):
                 detail=f"The {provider} image key's account has no credit left. This is a billing "
                        f"limit, not a daily cap, so waiting won't help.\n\n"
                        f"👉 Add credit on {provider}'s billing page, or switch Engine Config → Asset Art "
-                       f"to Cloudflare (free, backgrounds and cover only). The Copy button on each tile "
+                       f"to Cloudflare (free). The Copy button on each tile "
                        f"still works for pasting into an external image tool."
             )
         if kind == "daily":
